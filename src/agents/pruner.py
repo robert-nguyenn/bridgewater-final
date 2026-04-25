@@ -13,6 +13,7 @@ def run(
     debates: Optional[dict[str, Any]] = None,
     comparator: Optional[dict[str, float]] = None,
     case_study_subtree_roots: Optional[dict[str, str]] = None,
+    case_study_subtree_nodes: Optional[dict[str, set[str]]] = None,
     debate_margin_threshold: float = 0.0,
     similarity_threshold: float = 0.3,
     tools: Optional[ToolBundle] = None,
@@ -37,6 +38,7 @@ def run(
     debates = debates or {}
     comparator = comparator or {}
     case_study_subtree_roots = case_study_subtree_roots or {}
+    case_study_subtree_nodes = case_study_subtree_nodes or {}
 
     def emit(kind: str, **data: Any) -> None:
         if on_event is not None:
@@ -85,15 +87,22 @@ def run(
                 continue
         surviving_edges.append(edge)
 
-    # 2. Subtree similarity filter.
+    # 2. Subtree similarity filter. Prefer the explicit `subtree_nodes` set
+    # (used after the cs_root removal in stage 7); fall back to legacy
+    # reachability-from-root when only `subtree_roots` is provided.
     excluded: set[str] = set()
     for cs_key, similarity in comparator.items():
         if similarity >= similarity_threshold:
             continue
-        subtree_root = case_study_subtree_roots.get(cs_key)
-        if not subtree_root:
-            continue
-        subtree_nodes = _reachable_from(subtree_root, surviving_edges)
+        explicit_nodes = case_study_subtree_nodes.get(cs_key)
+        if explicit_nodes:
+            subtree_nodes = set(explicit_nodes)
+            subtree_root = "(multi-root)"
+        else:
+            subtree_root = case_study_subtree_roots.get(cs_key)
+            if not subtree_root:
+                continue
+            subtree_nodes = _reachable_from(subtree_root, surviving_edges)
         excluded |= subtree_nodes
         emit(
             "subtree_dropped",

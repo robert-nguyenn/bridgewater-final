@@ -117,7 +117,7 @@ def test_run_happy_path_attaches_labels():
     tools = ToolBundle(fred=fake_fred)
     client = _fake_client(PLAN_OK, LABEL_TWO)
 
-    out = analog_search.run(_node(), tools=tools, client=client, k=4)
+    out = analog_search.run(_node(), tools=tools, client=client, k=4, enable_web_search=False)
 
     assert len(out) == 2
     assert out[0].candidate_event == "Russia invades Ukraine"
@@ -137,7 +137,7 @@ def test_run_returns_empty_when_planner_picks_no_series():
     tools = ToolBundle(fred=fake_fred)
     client = _fake_client(PLAN_NULL)
 
-    out = analog_search.run(_node(), tools=tools, client=client)
+    out = analog_search.run(_node(), tools=tools, client=client, enable_web_search=False)
 
     assert out == []
     fake_fred.fred_find_extrema.assert_not_called()
@@ -148,7 +148,7 @@ def test_run_returns_empty_on_unparseable_plan():
     tools = ToolBundle(fred=fake_fred)
     client = _fake_client("not valid json at all")
 
-    out = analog_search.run(_node(), tools=tools, client=client)
+    out = analog_search.run(_node(), tools=tools, client=client, enable_web_search=False)
 
     assert out == []
     fake_fred.fred_find_extrema.assert_not_called()
@@ -162,7 +162,7 @@ def test_run_returns_empty_on_tool_error():
     tools = ToolBundle(fred=fake_fred)
     client = _fake_client(PLAN_OK)
 
-    out = analog_search.run(_node(), tools=tools, client=client)
+    out = analog_search.run(_node(), tools=tools, client=client, enable_web_search=False)
 
     assert out == []
     # Plan call happened but no label call (no episodes to label).
@@ -183,7 +183,7 @@ def test_run_filters_by_direction_from_plan():
     )
     client = _fake_client(PLAN_OK, label_one)
 
-    out = analog_search.run(_node(), tools=tools, client=client)
+    out = analog_search.run(_node(), tools=tools, client=client, enable_web_search=False)
 
     assert len(out) == 1
     assert out[0].magnitude == 3.4
@@ -207,7 +207,7 @@ def test_run_caps_at_k_by_magnitude():
     )
     client = _fake_client(PLAN_OK, label_two)
 
-    out = analog_search.run(_node(), tools=tools, client=client, k=2)
+    out = analog_search.run(_node(), tools=tools, client=client, k=2, enable_web_search=False)
 
     assert len(out) == 2
     assert out[0].magnitude == 3.5
@@ -217,7 +217,7 @@ def test_run_caps_at_k_by_magnitude():
 
 
 def test_run_handles_missing_fred_tool_gracefully():
-    out = analog_search.run(_node(), tools=ToolBundle())  # fred is None
+    out = analog_search.run(_node(), tools=ToolBundle(), enable_web_search=False)  # fred is None
     assert out == []
 
 
@@ -236,7 +236,7 @@ def test_run_label_response_with_fewer_entries_pads_with_none():
     )
     client = _fake_client(PLAN_OK, label_short)
 
-    out = analog_search.run(_node(), tools=tools, client=client)
+    out = analog_search.run(_node(), tools=tools, client=client, enable_web_search=False)
 
     assert len(out) == 2
     assert out[0].candidate_event == "only one"

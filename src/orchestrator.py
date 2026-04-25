@@ -30,7 +30,7 @@ from src.agents.moderator import ModeratorVerdict
 from src.agents.portfolio import PortfolioImpact
 from src.agents.scenario import TailScenario
 from src.config import MODEL
-from src.tools import make_default_tools
+from src.tools import make_default_tools, validate_citations
 from src.types import (
     CaseStudy,
     CausalGraph,
@@ -96,6 +96,7 @@ class PipelineResult:
     case_study_to_first_order: dict[str, str] = field(default_factory=dict)
     tail_scenarios: list[TailScenario] = field(default_factory=list)
     chain_verifications: dict[str, Any] = field(default_factory=dict)
+    citation_validations: dict[str, str] = field(default_factory=dict)
     progress_events: list[ProgressEvent] = field(default_factory=list)
     run_id: Optional[str] = None
 
@@ -504,10 +505,15 @@ def run_pipeline(
     emit("stage_complete", "Stage 6 done", stage=6)
 
     # ------------------------------------------------------------------
-    # Stage 7: Merge surviving subtrees + prune
+    # Stage 7: Merge surviving subtrees + prune.
+    # The cs_root (the historical triggering event node) is dropped during
+    # merge; its first-layer children become direct children of the
+    # corresponding first-order node via bridge edges. This avoids a
+    # synthetic intermediate that the chain verifier would interpret as a
+    # forward causal step.
     # ------------------------------------------------------------------
     emit("stage_start", "Stage 7: Merge surviving subtrees + Pruner", stage=7)
-    case_study_subtree_roots: dict[str, str] = {}
+    case_study_subtree_nodes: dict[str, set[str]] = {}
     n_attached = 0
     for cs in case_studies:
         if cs.similarity_score < similarity_threshold:
@@ -520,36 +526,72 @@ def run_pipeline(
             )
             continue
         fo_node_id = case_study_to_first_order.get(cs.id)
-        if fo_node_id is None:
+        fo_node = graph.nodes.get(fo_node_id) if fo_node_id else None
+        if fo_node is None:
             continue
-        subtree_root_id = cs.subtree.root or _first_node_id(cs.subtree)
-        if subtree_root_id is None:
+        cs_root_id = cs.subtree.root or _first_node_id(cs.subtree)
+        if cs_root_id is None:
             continue
-        case_study_subtree_roots[cs.id] = subtree_root_id
 
+        # Find first-layer children of the case-study root: the nodes the
+        # bridge edges should point at (one per direct child of cs_root).
+        first_layer_dst_ids = [
+            e.dst for e in cs.subtree.edges if e.src == cs_root_id
+        ]
+        if not first_layer_dst_ids:
+            continue
+
+        # Track which subtree nodes belong to this case study (excluding
+        # cs_root, which we're dropping). Used by the pruner for the
+        # similarity-based subtree drop.
+        attached_node_ids: set[str] = set()
+
+        # Copy subtree nodes EXCEPT cs_root, rebasing their layer values so
+        # they sit below the first-order node in the layered layout.
         for nid, n in cs.subtree.nodes.items():
-            if nid not in graph.nodes:
-                graph.nodes[nid] = n
-        graph.edges.extend(cs.subtree.edges)
-        graph.edges.append(
-            Edge(
-                src=fo_node_id,
-                dst=subtree_root_id,
-                mechanism=f"historical analog: {cs.name}",
-                sensitivity=cs.similarity_score,
-                confidence=cs.similarity_score,
+            if nid == cs_root_id:
+                continue
+            if nid in graph.nodes:
+                attached_node_ids.add(nid)
+                continue
+            if n.layer is not None and n.layer >= 1:
+                n.layer = (fo_node.layer or 1) + n.layer
+            graph.nodes[nid] = n
+            attached_node_ids.add(nid)
+
+        # Copy subtree edges EXCEPT those originating at cs_root (those are
+        # replaced by direct bridge edges from the first-order node).
+        for e in cs.subtree.edges:
+            if e.src == cs_root_id:
+                continue
+            graph.edges.append(e)
+
+        # Add a bridge edge per first-layer child, marked as a historical
+        # analog. The chain verifier treats these as boundary edges and won't
+        # verify chains that cross them.
+        for child_id in first_layer_dst_ids:
+            graph.edges.append(
+                Edge(
+                    src=fo_node_id,
+                    dst=child_id,
+                    mechanism=f"historical analog: {cs.name}",
+                    sensitivity=cs.similarity_score,
+                    confidence=cs.similarity_score,
+                )
             )
-        )
+
+        case_study_subtree_nodes[cs.id] = attached_node_ids
         n_attached += 1
         emit(
             "subtree_attached",
-            f"  Attach {cs.name!r} to first-order node {fo_node_id} (similarity {cs.similarity_score:.2f})",
+            f"  Attach {cs.name!r} to {fo_node.label!r} via {len(first_layer_dst_ids)} bridge edges "
+            f"(similarity {cs.similarity_score:.2f})",
             case_study_id=cs.id,
             name=cs.name,
             similarity=cs.similarity_score,
             first_order_id=fo_node_id,
-            n_nodes_added=len(cs.subtree.nodes),
-            n_edges_added=len(cs.subtree.edges) + 1,
+            n_bridges=len(first_layer_dst_ids),
+            n_nodes_added=len(attached_node_ids),
         )
 
     pre_prune_graph = copy.deepcopy(graph)
@@ -604,6 +646,8 @@ def run_pipeline(
         )
 
     similarity_by_cs = {cs.id: cs.similarity_score for cs in case_studies}
+    # Pruner now uses subtree_nodes (set per case study) since cs_root has been
+    # dropped during merge — there's no single subtree root to walk from.
 
     def _on_pruner_event(ev: dict[str, Any]) -> None:
         # Pop "kind" so **ev doesn't collide with emit's positional `kind` arg.
@@ -638,7 +682,7 @@ def run_pipeline(
         graph,
         debates=all_debates,
         comparator=similarity_by_cs,
-        case_study_subtree_roots=case_study_subtree_roots,
+        case_study_subtree_nodes=case_study_subtree_nodes,
         similarity_threshold=similarity_threshold,
         on_event=_on_pruner_event,
     )
@@ -721,6 +765,33 @@ def run_pipeline(
                 error=str(exc),
             )
 
+    # ------------------------------------------------------------------
+    # Stage 9.5: Validate cited evidence against real FRED / Yahoo data.
+    # Each cited_evidence string from adversary/defender/moderator
+    # transcripts is parsed and checked against the live tools. Results
+    # are cached on disk so repeated runs are fast. Statuses surface in
+    # the UI per-citation as ✓ / ✗ / • badges.
+    # ------------------------------------------------------------------
+    emit("stage_start", "Stage 9.5: validate cited evidence vs FRED/Yahoo", stage=9)
+    all_citations: list[str] = []
+    for d in all_debates.values():
+        if d.critique and d.critique.cited_evidence:
+            all_citations.extend(d.critique.cited_evidence)
+        if d.rebuttal and d.rebuttal.cited_evidence:
+            all_citations.extend(d.rebuttal.cited_evidence)
+    citation_validations = validate_citations(all_citations, tools) if all_citations else {}
+    n_ok = sum(1 for v in citation_validations.values() if v == "ok")
+    n_missing = sum(1 for v in citation_validations.values() if v == "missing")
+    n_unver = sum(1 for v in citation_validations.values() if v == "unverifiable")
+    emit(
+        "stage_complete",
+        f"Stage 9.5 done: {len(citation_validations)} unique citations "
+        f"({n_ok} verified, {n_missing} missing, {n_unver} unverifiable)",
+        n_ok=n_ok,
+        n_missing=n_missing,
+        n_unverifiable=n_unver,
+    )
+
     return PipelineResult(
         graph=graph,
         pre_prune_graph=pre_prune_graph,
@@ -731,6 +802,7 @@ def run_pipeline(
         case_study_to_first_order=case_study_to_first_order,
         tail_scenarios=tail_scenarios,
         chain_verifications=chain_verifications,
+        citation_validations=citation_validations,
         progress_events=progress_events,
         run_id=run_id,
     )

@@ -196,6 +196,7 @@ def _serialize_pipeline_result(result: PipelineResult) -> dict[str, Any]:
         "comparator_results": {k: _serialize(v) for k, v in result.comparator_results.items()},
         "case_study_to_first_order": result.case_study_to_first_order,
         "tail_scenarios": [_serialize(s) for s in result.tail_scenarios],
+        "citation_validations": dict(result.citation_validations),
         "run_id": result.run_id,
     }
 

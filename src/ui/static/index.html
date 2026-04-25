@@ -128,6 +128,20 @@
            margin: 6px 0; color: var(--text); font-size: 11px; line-height: 1.4; }
   .quote .who { color: var(--muted); font-weight: 600; font-size: 10px;
                 text-transform: uppercase; letter-spacing: 0.5px; }
+  .citation-badge {
+    display: inline-block; padding: 1px 5px; border-radius: 2px;
+    font-size: 10px; margin: 2px 4px 2px 0; font-family: inherit;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  .citation-badge.ok { color: var(--pos); border-color: var(--pos); }
+  .citation-badge.missing { color: var(--neg); border-color: var(--neg); text-decoration: line-through; }
+  .citation-badge.unverifiable { color: var(--muted); }
+  .case-study-row { display: flex; justify-content: space-between; align-items: center;
+                    gap: 8px; padding: 5px 0; border-bottom: 1px dotted var(--border); font-size: 11px; }
+  .case-study-row .cs-meta { flex: 1; min-width: 0; }
+  .case-study-row .cs-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .case-study-row .cs-detail { color: var(--muted); font-size: 10px; }
+  .case-study-row button { padding: 2px 8px; font-size: 10px; }
 
   .stage-tag {
     display: inline-flex; align-items: center; gap: 8px;
@@ -407,13 +421,18 @@ function ingestState(data) {
     return;
   }
 
-  // Single-graph mode. Priority: pruned > merged > in-progress subtree > trunk.
+  // Single-graph mode. Priority: explicit case-study viewing > pruned > merged > in-progress subtree > trunk.
   CenterEl.classList.remove("grid-view");
   GridCellsEl.style.display = "none";
   GridCellsEl.innerHTML = "";
 
   let g = null, tag = null;
-  if (data.pruned_graph) { g = data.pruned_graph; tag = "PRUNED"; }
+  if (viewingCaseStudyId && data.subtrees && data.subtrees[viewingCaseStudyId]) {
+    const cs = data.subtrees[viewingCaseStudyId];
+    g = cs.graph;
+    tag = `CASE STUDY: ${cs.name || viewingCaseStudyId}`;
+  }
+  else if (data.pruned_graph) { g = data.pruned_graph; tag = "PRUNED"; }
   else if (data.merged_graph) { g = data.merged_graph; tag = "MERGED (pre-prune)"; }
   else if (inProgressSubtree && inProgressSubtree.graph) {
     g = inProgressSubtree.graph;
@@ -642,11 +661,15 @@ function renderOverviewDrawer() {
     <div class="row"><span class="k">tail scenarios</span><span class="v">${(r.tail_scenarios || []).length}</span></div>
     <h3 style="margin-top: 16px;">portfolio impact</h3>
     ${portfolio || '<div class="sub">no portfolio impacts</div>'}
-    <h3 style="margin-top: 16px;">case studies</h3>
+    <h3 style="margin-top: 16px;">case studies (click to view full subtree)</h3>
+    ${viewingCaseStudyId ? `<button onclick="viewMergedGraph()" style="margin-bottom: 8px;">← back to merged graph</button>` : ''}
     ${r.case_studies.map(cs => `
-      <div class="row">
-        <span class="k">${escapeHtml(cs.name)}</span>
-        <span class="v ${cs.similarity_score >= 0.3 ? 'pos' : 'neg'}">sim ${cs.similarity_score.toFixed(2)}</span>
+      <div class="case-study-row">
+        <div class="cs-meta">
+          <div class="cs-name">${escapeHtml(cs.name)}</div>
+          <div class="cs-detail">sim <span class="${cs.similarity_score >= 0.2 ? 'v pos' : 'v neg'}">${cs.similarity_score.toFixed(2)}</span> · ${cs.subtree?.nodes ? Object.keys(cs.subtree.nodes).length : 0} nodes</div>
+        </div>
+        <button onclick="viewCaseStudy('${escapeHtml(cs.id)}')">view</button>
       </div>
     `).join("")}
     ${scenarios ? `<h3 style="margin-top: 16px;">tail scenarios (stage 10)</h3>${scenarios}` : ''}
@@ -709,12 +732,12 @@ function renderEdgeDrawer(edge, graph, state) {
       <div class="quote">
         <div class="who">adversary · ${escapeHtml(c.attack_type || 'no type')} · score ${(c.score || 0).toFixed(2)}</div>
         ${escapeHtml(c.counterargument || '')}
-        ${(c.cited_evidence && c.cited_evidence.length) ? `<br><small style="color: var(--muted);">cited: ${escapeHtml(c.cited_evidence.join(', '))}</small>` : ''}
+        ${(c.cited_evidence && c.cited_evidence.length) ? `<br><small style="color: var(--muted);">cited: ${renderCitations(c.cited_evidence)}</small>` : ''}
       </div>
       <div class="quote">
         <div class="who">defender · ${escapeHtml(r.defense_type || 'no type')} · score ${(r.score || 0).toFixed(2)}</div>
         ${escapeHtml(r.rebuttal || '')}
-        ${(r.cited_evidence && r.cited_evidence.length) ? `<br><small style="color: var(--muted);">cited: ${escapeHtml(r.cited_evidence.join(', '))}</small>` : ''}
+        ${(r.cited_evidence && r.cited_evidence.length) ? `<br><small style="color: var(--muted);">cited: ${renderCitations(r.cited_evidence)}</small>` : ''}
       </div>
     `;
   }
@@ -747,6 +770,31 @@ function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[ch]));
+}
+
+// Render an array of citation strings as colored badges based on the
+// citation_validations dict on the current pipeline result. ✓ ok, ✗ missing,
+// • unverifiable.
+function renderCitations(refs) {
+  if (!refs || !refs.length) return '';
+  const validations = currentResult?.citation_validations || {};
+  return refs.map(r => {
+    const status = validations[r] || "unverifiable";
+    const symbol = status === "ok" ? "✓" : status === "missing" ? "✗" : "•";
+    return `<span class="citation-badge ${status}" title="${escapeHtml(status)}">${symbol} ${escapeHtml(r)}</span>`;
+  }).join("");
+}
+
+// Set the center-pane view to a specific case-study subtree (full subtree
+// including its historical root, before stage 7's cs_root removal).
+let viewingCaseStudyId = null;
+function viewCaseStudy(csId) {
+  viewingCaseStudyId = csId;
+  pollOnce();
+}
+function viewMergedGraph() {
+  viewingCaseStudyId = null;
+  pollOnce();
 }
 
 RunBtn.addEventListener("click", startRun);
