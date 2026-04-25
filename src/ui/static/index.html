@@ -48,6 +48,8 @@
   .subtree-cell { position: relative; border: 1px solid var(--border); background: var(--bg-2); border-radius: 3px; overflow: hidden; }
   .subtree-cell .cell-label { position: absolute; top: 3px; left: 3px; background: var(--bg); padding: 2px 6px; font-size: 9px; color: var(--accent); border-radius: 2px; z-index: 5; max-width: 80%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; user-select: none; }
   .subtree-cell .cell-label:hover { background: var(--accent); color: var(--bg); }
+  .subtree-cell .cell-dates { position: absolute; top: 22px; left: 3px; background: var(--bg); padding: 1px 6px; font-size: 9px; color: var(--muted); border-radius: 2px; z-index: 5; max-width: 80%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtree-cell .cell-dates:empty { display: none; }
   .subtree-cell .cell-status { position: absolute; top: 3px; right: 3px; background: var(--bg); padding: 1px 5px; font-size: 9px; border-radius: 2px; z-index: 5; }
   .subtree-cell .cell-status.live { color: var(--accent); }
   .subtree-cell .cell-status.complete { color: var(--pos); }
@@ -219,6 +221,10 @@
           <span>Show all case study maps</span>
         </label>
       </div>
+      <div style="margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap;">
+        <button id="view-trunk-btn" class="header-btn" style="font-size: 9px; padding: 2px 8px;" title="Show the trunk + first-order nodes (skip case study subtrees)">← Trunk + first-order</button>
+        <button id="view-consensus-btn" class="header-btn" style="font-size: 9px; padding: 2px 8px;" title="Headline view: archetypes that recur across multiple historical analogs, sized by consensus weight">★ Consensus archetypes</button>
+      </div>
     </div>
     <div class="pane">
       <h3>Portfolio context (optional)</h3>
@@ -304,6 +310,30 @@ ToggleMulti.addEventListener("change", () => {
   // Instant re-render from cached state. The pollLoop (when live) will
   // refresh on its next tick anyway; for completed runs the cache is the
   // authoritative latest state.
+  if (ToggleMulti.checked) {
+    viewingTrunk = false;
+    viewingConsensus = false;
+  }
+  if (lastIngestedData) ingestState(lastIngestedData);
+});
+
+document.getElementById("view-trunk-btn").addEventListener("click", () => {
+  // Explicit "show me the trunk" navigation. Overrides the merged/pruned
+  // graph priority in update() until the user picks a different view.
+  ToggleMulti.checked = false;
+  viewingCaseStudyId = null;
+  viewingConsensus = false;
+  viewingTrunk = true;
+  if (lastIngestedData) ingestState(lastIngestedData);
+});
+
+document.getElementById("view-consensus-btn").addEventListener("click", () => {
+  // Headline view: clustered archetypes across surviving case studies.
+  // Wins the priority order until the user picks a different view.
+  ToggleMulti.checked = false;
+  viewingCaseStudyId = null;
+  viewingTrunk = false;
+  viewingConsensus = true;
   if (lastIngestedData) ingestState(lastIngestedData);
 });
 
@@ -330,6 +360,8 @@ let currentResult = null;
 let pollTimer = null;
 let lastEventCount = 0;
 let lastIngestedData = null; // cache of the most recent state for instant toggle re-renders
+let viewingTrunk = false;    // user explicitly asked for the trunk view
+let viewingConsensus = false;// user explicitly asked for the consensus view
 
 async function fetchJson(url, opts) {
   const r = await fetch(url, opts);
@@ -366,6 +398,8 @@ async function loadRun(runId) {
   EventsEl.innerHTML = "";
   delete DrawerEl.dataset.locked;
   viewingCaseStudyId = null;
+  viewingTrunk = false;
+  viewingConsensus = false;
   await pollOnce();
   loadRuns();
   updateBackToLiveButton();
@@ -516,7 +550,17 @@ function ingestState(data) {
   GridCellsEl.removeAttribute("data-ids");
 
   let g = null, tag = null;
-  if (viewingCaseStudyId && data.subtrees && data.subtrees[viewingCaseStudyId]) {
+  if (viewingConsensus && data.consensus_graph) {
+    g = data.consensus_graph;
+    const nE = (g.edges || []).length;
+    const nR = (g.edges || []).filter(e => (e.member_count || 0) > 1).length;
+    tag = `CONSENSUS ARCHETYPES (${Object.keys(g.nodes || {}).length} archetypes, ${nR}/${nE} recurrent)`;
+  }
+  else if (viewingTrunk && data.trunk) {
+    g = data.trunk;
+    tag = "TRUNK + first-order";
+  }
+  else if (viewingCaseStudyId && data.subtrees && data.subtrees[viewingCaseStudyId]) {
     const cs = data.subtrees[viewingCaseStudyId];
     g = cs.graph;
     tag = `CASE STUDY MAP: ${cs.name || viewingCaseStudyId}`;
@@ -575,6 +619,7 @@ function renderSubtreeGrid(subtrees, state) {
       cell.dataset.csId = csId;
       cell.innerHTML = `
         <span class="cell-label"></span>
+        <span class="cell-dates"></span>
         <span class="cell-status"></span>
         <svg></svg>
       `;
@@ -591,9 +636,15 @@ function renderSubtreeGrid(subtrees, state) {
     labelEl.onclick = () => {
       // Drill into this specific subtree in single-view mode.
       ToggleMulti.checked = false;
+      viewingTrunk = false;
       viewingCaseStudyId = csId;
       pollOnce();
     };
+    const dateEl = cell.querySelector(".cell-dates");
+    if (dateEl) {
+      const dr = info.date_range;
+      dateEl.textContent = (Array.isArray(dr) && dr.length === 2) ? formatDateRange(dr[0], dr[1]) : "";
+    }
     const status = cell.querySelector(".cell-status");
     status.textContent = info.complete ? "✓ done" : "live";
     status.className = "cell-status " + (info.complete ? "complete" : "live");
@@ -603,6 +654,10 @@ function renderSubtreeGrid(subtrees, state) {
 }
 
 
+// Persist d3.zoom transforms across re-renders so a polled refresh doesn't
+// snap the user back to identity while they're zoomed in.
+const _zoomTransforms = new WeakMap();
+
 function renderGraph(svgSel, graph, state, mini = false) {
   svgSel.selectAll("*").remove();
   const bbox = svgSel.node().getBoundingClientRect();
@@ -610,6 +665,24 @@ function renderGraph(svgSel, graph, state, mini = false) {
   const nodes = Object.values(graph.nodes || {});
   const edges = (graph.edges || []).filter(e => graph.nodes[e.src] && graph.nodes[e.dst]);
   if (!nodes.length) return;
+
+  // Consensus graphs use `avg_sensitivity` on edges and carry a per-node
+  // `consensus_weight` (recurrence across case studies). Use those when
+  // present; otherwise fall back to per-edge sensitivity.
+  const isConsensus = nodes.some(n => typeof n.consensus_weight === "number");
+  const edgeSens = (e) => {
+    const s = (e.avg_sensitivity ?? e.sensitivity ?? 0);
+    return Math.max(0, Math.min(1, s));
+  };
+
+  // Per-node "incoming sensitivity" — the strongest causal claim landing on
+  // each node. Drives node radius below in non-consensus views.
+  const incomingSens = new Map();
+  for (const e of edges) {
+    const s = edgeSens(e);
+    const cur = incomingSens.get(e.dst) || 0;
+    if (s > cur) incomingSens.set(e.dst, s);
+  }
 
   // Layered layout: nodes grouped by `layer`, columns spaced left to right.
   const byLayer = d3.group(nodes, n => n.layer || 0);
@@ -627,13 +700,23 @@ function renderGraph(svgSel, graph, state, mini = false) {
 
   // Edges
   const linkColor = (e) => {
-    const sens = e.sensitivity || 0;
+    const sens = edgeSens(e);
     if (sens > 0.6) return "var(--pos)";
     if (sens < 0.3) return "var(--muted)";
     return "var(--info)";
   };
-  const linkWidth = (e) => 1 + 4 * (e.sensitivity || 0);
-  const linkOpacity = (e) => 0.3 + 0.7 * (e.confidence || 0);
+  // In consensus mode, thickness combines avg_sensitivity with the
+  // recurrence weight (how many case studies agreed on this transition) so
+  // links seen in many analogs are visually heavier even at modest sensitivity.
+  const linkWidth = (e) => {
+    const s = edgeSens(e);
+    if (isConsensus) {
+      const w = Math.max(0, Math.min(1, e.consensus_weight || 0));
+      return 1 + 5 * (0.4 * s + 0.6 * w);
+    }
+    return 1 + 4 * s;
+  };
+  const linkOpacity = (e) => 0.3 + 0.7 * (e.avg_confidence ?? e.confidence ?? 0);
 
   // Compute curve offsets so edges between nodes in the same layer don't
   // overlap. Edges are grouped by (src_layer, dst_layer) and offset within
@@ -654,7 +737,23 @@ function renderGraph(svgSel, graph, state, mini = false) {
     ids.forEach((id, i) => edgeOrdinal.set(id, i));
   }
 
-  const linkGroup = svgSel.append("g").attr("class", "links");
+  // d3.zoom: attach to the svg, apply transforms to a wrapping <g>. All
+  // visible content (links + nodes) goes inside zoomG so pan/zoom moves them
+  // together. We restore the prior transform from _zoomTransforms so polled
+  // re-renders don't reset the user's view.
+  const zoomG = svgSel.append("g").attr("class", "zoom-root");
+  const zoom = d3.zoom().scaleExtent([0.25, 6]).on("zoom", (evt) => {
+    zoomG.attr("transform", evt.transform);
+    _zoomTransforms.set(svgSel.node(), evt.transform);
+  });
+  svgSel.call(zoom);
+  const priorTransform = _zoomTransforms.get(svgSel.node());
+  if (priorTransform) {
+    zoomG.attr("transform", priorTransform);
+    svgSel.call(zoom.transform, priorTransform);
+  }
+
+  const linkGroup = zoomG.append("g").attr("class", "links");
   linkGroup.selectAll("path").data(edges).join("path")
     .attr("class", e => {
       let cls = "link";
@@ -671,23 +770,49 @@ function renderGraph(svgSel, graph, state, mini = false) {
     .attr("stroke-opacity", linkOpacity)
     .attr("d", e => curve(idToNode.get(e.src), idToNode.get(e.dst), edgeOrdinal.get(e.id) || 0))
     .on("click", (ev, e) => renderEdgeDrawer(e, graph, state))
-    .append("title").text(e => `${idToNode.get(e.src)?.label} -> ${idToNode.get(e.dst)?.label}\nmechanism: ${e.mechanism}\nsensitivity: ${(e.sensitivity || 0).toFixed(2)}\nconfidence: ${(e.confidence || 0).toFixed(2)}`);
+    .append("title").text(e => {
+      const sens = (e.avg_sensitivity ?? e.sensitivity ?? 0).toFixed(2);
+      const conf = (e.avg_confidence ?? e.confidence ?? 0).toFixed(2);
+      const mech = e.canonical_mechanism || e.mechanism || "";
+      const consensusLine = (typeof e.consensus_weight === "number")
+        ? `\nconsensus: ${(e.consensus_weight * 100).toFixed(0)}% (${e.member_count || 0} case studies)`
+        : "";
+      return `${idToNode.get(e.src)?.label} -> ${idToNode.get(e.dst)?.label}\nmechanism: ${mech}\nsensitivity: ${sens}\nconfidence: ${conf}${consensusLine}`;
+    });
 
   // Nodes
-  const nodeGroup = svgSel.append("g").attr("class", "nodes");
+  const nodeGroup = zoomG.append("g").attr("class", "nodes");
   const nodeSel = nodeGroup.selectAll("g").data(nodes).join("g")
     .attr("class", n => "node" + (n.id === graph.root ? " is-root" : ""))
     .attr("transform", n => `translate(${n._x},${n._y})`)
     .on("click", (ev, n) => renderNodeDrawer(n, state));
 
+  // Radius logic: in consensus view, scale by recurrence weight (how many
+  // case studies voted for this archetype). In other views, scale by the
+  // strongest incoming edge sensitivity. Roots always render at max.
+  const rMin = mini ? 3 : 5;
+  const rMax = mini ? 9 : 14;
+  function nodeRadius(n) {
+    if (n.id === graph.root) return rMax;
+    const driver = isConsensus
+      ? Math.max(0, Math.min(1, n.consensus_weight || 0))
+      : (incomingSens.get(n.id) || 0);
+    return rMin + (rMax - rMin) * driver;
+  }
+
   nodeSel.append("circle")
-    .attr("r", n => n.id === graph.root ? (mini ? 6 : 10) : (mini ? 4 : 7))
+    .attr("r", nodeRadius)
     .attr("fill", n => layerColor(n.layer));
   if (!mini) {
     nodeSel.append("text").attr("dx", 12).attr("dy", 4)
       .text(n => truncate(n.label || n.id, 32));
   }
-  nodeSel.append("title").text(n => `${n.label}\n(${n.id})\n${n.description || ""}`);
+  nodeSel.append("title").text(n => {
+    const consensusLine = (typeof n.consensus_weight === "number" && n.member_count > 0)
+      ? `\nconsensus: ${(n.consensus_weight * 100).toFixed(0)}% (${n.member_count} case studies)`
+      : "";
+    return `${n.label}\n(${n.id})${consensusLine}\n${n.description || ""}`;
+  });
 }
 
 // `ordinal` separates parallel/same-layer edges so they don't overlap.
@@ -719,6 +844,22 @@ function layerColor(layer) {
 function truncate(s, n) {
   s = String(s || "");
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// "2011-03-11" -> "Mar 2011". Display compactly in the multi-grid cell badge.
+function formatYearMonth(iso) {
+  if (!iso) return "";
+  const m = String(iso).match(/^(\d{4})-(\d{2})/);
+  if (!m) return String(iso);
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return `${months[parseInt(m[2], 10) - 1] || m[2]} ${m[1]}`;
+}
+function formatDateRange(startIso, endIso) {
+  const a = formatYearMonth(startIso);
+  const b = formatYearMonth(endIso);
+  if (!a && !b) return "";
+  if (a && b && a === b) return a;
+  return `${a} – ${b}`;
 }
 
 // =================================================================
@@ -775,10 +916,44 @@ function renderOverviewDrawer() {
   `;
 }
 
+// Resolve a case-study id to its display name via the consensus graph's
+// index. Returns the raw id if no match. "trunk" stays as "trunk".
+function resolveCsName(state, csId) {
+  const idx = state?.consensus_graph?.case_study_index || {};
+  return idx[csId] || csId;
+}
+
+// "appears in: Fukushima 2011 (3 nodes), Iraq 2003 (1 node), ..."
+// Renders the attribution list on a consensus node or edge.
+function renderConsensusAttribution(state, members, kind) {
+  if (!Array.isArray(members) || !members.length) return "";
+  const counts = new Map();
+  for (const tup of members) {
+    if (!Array.isArray(tup) || !tup.length) continue;
+    const csId = tup[0];
+    if (csId === "trunk") continue;
+    counts.set(csId, (counts.get(csId) || 0) + 1);
+  }
+  if (!counts.size) return "";
+  const rows = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([csId, n]) => `<div class="row"><span class="k">${escapeHtml(resolveCsName(state, csId))}</span><span class="v">${n} ${kind}${n > 1 ? "s" : ""}</span></div>`)
+    .join("");
+  return `<h3 style="margin-top: 12px;">appears in</h3>${rows}`;
+}
+
 function renderNodeDrawer(node, state) {
   DrawerEl.dataset.locked = "1";
   const layer = node.layer ?? 0;
   const ac = node.asset_class || "(none)";
+  const isConsensus = typeof node.consensus_weight === "number";
+  const consensusBlock = isConsensus ? `
+    <div class="row"><span class="k">consensus weight</span>
+      <span class="v ${node.consensus_weight >= 0.5 ? 'pos' : ''}">${(node.consensus_weight * 100).toFixed(0)}%</span></div>
+    <div class="row"><span class="k">case studies</span>
+      <span class="v">${node.member_count || 0} agreeing</span></div>
+    ${renderConsensusAttribution(state, node.member_node_ids, "node")}
+  ` : '';
   DrawerEl.innerHTML = `
     <h2>${escapeHtml(node.label || node.id)}</h2>
     <div class="sub">${escapeHtml(node.id)} · layer ${layer} · ${ac}</div>
@@ -787,6 +962,7 @@ function renderNodeDrawer(node, state) {
     ${node.magnitude_estimate !== null && node.magnitude_estimate !== undefined ? `
       <div class="row"><span class="k">magnitude</span><span class="v">${node.magnitude_estimate}</span></div>
     ` : ''}
+    ${consensusBlock}
     ${(node.evidence && node.evidence.length) ? `
       <h3 style="margin-top: 12px;">evidence</h3>
       ${node.evidence.map(ev => `
@@ -848,9 +1024,20 @@ function renderEdgeDrawer(edge, graph, state) {
     </h2>
     <div class="sub">edge id: ${escapeHtml(edge.id)}</div>
     <div class="row"><span class="k">mechanism</span></div>
-    <div class="quote">${escapeHtml(edge.mechanism || '')}</div>
-    <div class="row"><span class="k">sensitivity</span><span class="v">${(edge.sensitivity || 0).toFixed(2)}</span></div>
-    <div class="row"><span class="k">confidence</span><span class="v">${(edge.confidence || 0).toFixed(2)}</span></div>
+    <div class="quote">${escapeHtml(edge.canonical_mechanism || edge.mechanism || '')}</div>
+    <div class="row"><span class="k">sensitivity</span><span class="v">${(edge.avg_sensitivity ?? edge.sensitivity ?? 0).toFixed(2)}</span></div>
+    <div class="row"><span class="k">confidence</span><span class="v">${(edge.avg_confidence ?? edge.confidence ?? 0).toFixed(2)}</span></div>
+    ${typeof edge.consensus_weight === "number" ? `
+      <div class="row"><span class="k">consensus weight</span>
+        <span class="v ${edge.consensus_weight >= 0.5 ? 'pos' : ''}">${(edge.consensus_weight * 100).toFixed(0)}%</span></div>
+      <div class="row"><span class="k">case studies</span>
+        <span class="v">${edge.member_count || 0} agreeing</span></div>
+      ${renderConsensusAttribution(state, edge.member_edge_ids, "edge")}
+      ${(edge.member_mechanisms && edge.member_mechanisms.length > 1) ? `
+        <h3 style="margin-top: 12px;">alternative phrasings</h3>
+        ${edge.member_mechanisms.slice(1, 6).map(m => `<div class="quote" style="font-size: 11px;">${escapeHtml(m)}</div>`).join("")}
+      ` : ''}
+    ` : ''}
     ${(edge.supporting_data && edge.supporting_data.length) ? `
       <h3 style="margin-top: 12px;">supporting data</h3>
       ${edge.supporting_data.map(ev => `

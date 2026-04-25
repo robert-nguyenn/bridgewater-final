@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 from src.agents import (
     adversary,
     analog_search,
+    consensus as consensus_agent,
     defender,
     idea,
     logic_verifier,
@@ -37,6 +38,7 @@ from src.tools import make_default_tools, validate_citations
 from src.types import (
     CaseStudy,
     CausalGraph,
+    ConsensusGraph,
     Edge,
     Episode,
     MacroSnapshot,
@@ -102,6 +104,7 @@ class PipelineResult:
     chain_verifications: dict[str, Any] = field(default_factory=dict)
     citation_validations: dict[str, str] = field(default_factory=dict)
     link_applicabilities: dict[str, Any] = field(default_factory=dict)
+    consensus_graph: Optional[ConsensusGraph] = None
     progress_events: list[ProgressEvent] = field(default_factory=list)
     run_id: Optional[str] = None
 
@@ -473,6 +476,7 @@ def run_pipeline(
             first_order_id=primary_fo.id,
             similarity=cs.similarity_score,
             n_first_order_claimers=len(surviving_fo_ids),
+            date_range=[cs.date_range[0].isoformat(), cs.date_range[1].isoformat()],
         )
         build_tasks.append((primary_fo, cs))
 
@@ -596,6 +600,7 @@ def run_pipeline(
             n_nodes=len(cs_built.subtree.nodes),
             n_edges=len(cs_built.subtree.edges),
             subtree=copy.deepcopy(cs_built.subtree),
+            date_range=[cs_built.date_range[0].isoformat(), cs_built.date_range[1].isoformat()],
         )
         return fo_node, cs_built
 
@@ -1010,6 +1015,7 @@ def run_pipeline(
             case_study_id=cs.id,
             name=cs.name,
             subtree=copy.deepcopy(finalized_graph),
+            date_range=[cs.date_range[0].isoformat(), cs.date_range[1].isoformat()],
         )
 
     # ------------------------------------------------------------------
@@ -1109,6 +1115,50 @@ def run_pipeline(
         n_unverifiable=n_unver,
     )
 
+    # ------------------------------------------------------------------
+    # Stage 11: Consensus archetype synthesis. Cluster surviving
+    # subtree-contributed nodes into archetypes via one batched LLM call,
+    # remap and pool edges through the cluster assignment, preserve full
+    # per-case-study attribution. The output graph is the headline view:
+    # "where do multiple historical analogs converge?"
+    # ------------------------------------------------------------------
+    emit("stage_start", "Stage 11: ConsensusAgent (archetype synthesis)", stage=11)
+    consensus_graph: Optional[ConsensusGraph] = None
+    try:
+        consensus_graph = consensus_agent.build_consensus(
+            graph,
+            case_study_subtree_nodes,
+            case_studies,
+            model=MODEL_FAST,
+            client=client,
+            run_id=run_id,
+        )
+        n_cnodes = len(consensus_graph.nodes)
+        n_cedges = len(consensus_graph.edges)
+        # How aggressive was the clustering? base_node_count / cnode_count.
+        n_base = max(1, len(graph.nodes))
+        compression = round(n_base / max(1, n_cnodes), 2)
+        n_recurrent_edges = sum(1 for e in consensus_graph.edges if e.member_count > 1)
+        emit(
+            "consensus_built",
+            f"Stage 11 done: consensus graph {n_cnodes} archetypes, {n_cedges} edges "
+            f"({compression}× compression; {n_recurrent_edges} edges recur in ≥2 case studies)",
+            stage=11,
+            n_archetypes=n_cnodes,
+            n_edges=n_cedges,
+            n_recurrent_edges=n_recurrent_edges,
+            compression=compression,
+            consensus_graph=copy.deepcopy(consensus_graph),
+        )
+    except Exception as exc:
+        logger.warning("Stage 11 ConsensusAgent failed: %s", exc)
+        emit(
+            "stage_failed",
+            f"Stage 11 failed: {type(exc).__name__}: {exc}",
+            stage=11,
+            error=str(exc),
+        )
+
     return PipelineResult(
         graph=graph,
         pre_prune_graph=pre_prune_graph,
@@ -1122,6 +1172,7 @@ def run_pipeline(
         chain_verifications=chain_verifications,
         citation_validations=citation_validations,
         link_applicabilities=link_applicabilities,
+        consensus_graph=consensus_graph,
         progress_events=progress_events,
         run_id=run_id,
     )

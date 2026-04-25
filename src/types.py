@@ -100,3 +100,65 @@ class ToolBundle:
     hf: Any = None
     central_bank: Any = None
     news: Any = None
+
+
+def _new_consensus_node_id() -> str:
+    return f"cn_{uuid.uuid4().hex[:8]}"
+
+
+def _new_consensus_edge_id() -> str:
+    return f"ce_{uuid.uuid4().hex[:8]}"
+
+
+@dataclass
+class ConsensusNode:
+    """An archetype node clustered across surviving case-study subtrees.
+
+    `member_node_ids` is the list of (case_study_id, original_node_id) pairs
+    that contributed to this cluster — drives the "appears in: X, Y, Z"
+    attribution list in the drawer. `consensus_weight` is the share of
+    surviving case studies that voted for this archetype, in [0, 1].
+
+    Trunk nodes (root + first-order) are represented as singleton clusters
+    with member_node_ids=[("trunk", original_id)] so the trunk preserves its
+    identity through this stage.
+    """
+    id: str
+    label: str
+    description: str
+    layer: int
+    asset_class: Optional[str] = None
+    member_node_ids: list[tuple[str, str]] = field(default_factory=list)
+    member_count: int = 0  # |distinct contributing case studies|
+    consensus_weight: float = 0.0  # in [0, 1]
+
+
+@dataclass
+class ConsensusEdge:
+    """A pooled directed edge in the consensus graph.
+
+    All original edges sharing the same (src_cluster, dst_cluster) collapse
+    here. `member_edge_ids` carries the (case_study_id, original_edge_id)
+    attribution. `consensus_weight` is the share of surviving case studies
+    that contributed at least one original edge. `avg_sensitivity` /
+    `avg_confidence` are means over the original edges (single-analog
+    conviction), distinct from consensus_weight (cross-analog agreement)."""
+    src: str  # ConsensusNode.id
+    dst: str  # ConsensusNode.id
+    canonical_mechanism: str
+    avg_sensitivity: float
+    avg_confidence: float
+    consensus_weight: float = 0.0  # in [0, 1]
+    member_count: int = 0
+    member_edge_ids: list[tuple[str, str]] = field(default_factory=list)
+    member_mechanisms: list[str] = field(default_factory=list)
+    id: str = field(default_factory=_new_consensus_edge_id)
+
+
+@dataclass
+class ConsensusGraph:
+    nodes: dict[str, ConsensusNode] = field(default_factory=dict)
+    edges: list[ConsensusEdge] = field(default_factory=list)
+    root: Optional[str] = None
+    case_study_index: dict[str, str] = field(default_factory=dict)
+    # cs_id -> human-readable name, used by the UI drawer for attribution.

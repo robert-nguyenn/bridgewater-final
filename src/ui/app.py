@@ -77,6 +77,7 @@ def _save_run_state(run_id: str, *, force: bool = False) -> None:
             "subtrees": dict(state.get("subtrees") or {}),
             "merged_graph": state.get("merged_graph"),
             "pruned_graph": state.get("pruned_graph"),
+            "consensus_graph": state.get("consensus_graph"),
             "result": state.get("result"),
             "request": state.get("request"),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -136,6 +137,7 @@ def _load_run_states(max_runs: int = LOAD_MAX_RUNS) -> int:
                 "subtrees": snap.get("subtrees") or {},
                 "merged_graph": snap.get("merged_graph"),
                 "pruned_graph": snap.get("pruned_graph"),
+                "consensus_graph": snap.get("consensus_graph"),
                 "result": snap.get("result"),
                 "request": snap.get("request"),
             }
@@ -206,17 +208,30 @@ def _on_progress_factory(run_id: str):
             # Snapshot intermediate graphs as they fly past.
             if ev.kind == "stage_complete" and data.get("stage") == 1 and data.get("trunk"):
                 state["trunk"] = _serialize(data["trunk"])
+            elif ev.kind == "case_study_started":
+                # Pre-seed the cell's metadata (name, date_range) so the multi-grid
+                # can show it before any subtree nodes have been built.
+                cs_id = data.get("case_study_id")
+                if cs_id:
+                    state["subtrees"].setdefault(cs_id, {})
+                    update = {"name": data.get("name") or state["subtrees"][cs_id].get("name")}
+                    if data.get("date_range"):
+                        update["date_range"] = data["date_range"]
+                    state["subtrees"][cs_id].update(update)
             elif ev.kind == "case_study_built" and data.get("subtree"):
                 cs_id = data.get("case_study_id")
                 if cs_id:
                     state["subtrees"].setdefault(cs_id, {})
-                    state["subtrees"][cs_id].update({
+                    update = {
                         "name": data.get("name"),
                         "first_order_label": data.get("first_order_label"),
                         "graph": _serialize(data["subtree"]),
                         "complete": True,
                         "updated_at": datetime.now().isoformat(timespec="seconds"),
-                    })
+                    }
+                    if data.get("date_range"):
+                        update["date_range"] = data["date_range"]
+                    state["subtrees"][cs_id].update(update)
             elif ev.kind in ("subtree_init", "subtree_candidate_added", "subtree_candidate_merged") and data.get("partial_graph"):
                 # Live partial subtree snapshot. Lets the UI render the tree
                 # as it is being built, between case_study_started and case_study_built.
@@ -238,13 +253,16 @@ def _on_progress_factory(run_id: str):
                 cs_id = data.get("case_study_id")
                 if cs_id:
                     state["subtrees"].setdefault(cs_id, {})
-                    state["subtrees"][cs_id].update({
+                    update = {
                         "name": data.get("name") or state["subtrees"][cs_id].get("name"),
                         "first_order_label": state["subtrees"][cs_id].get("first_order_label"),
                         "graph": _serialize(data["subtree"]),
                         "complete": True,
                         "updated_at": datetime.now().isoformat(timespec="seconds"),
-                    })
+                    }
+                    if data.get("date_range"):
+                        update["date_range"] = data["date_range"]
+                    state["subtrees"][cs_id].update(update)
             elif ev.kind in ("subtree_dropped_finalize", "subtree_skipped"):
                 # Case study was dropped pre-merge (similarity/applies-today)
                 # or post-merge (no nodes survived). Either way it has no
@@ -262,6 +280,8 @@ def _on_progress_factory(run_id: str):
                 state["merged_graph"] = _serialize(data["merged_graph"])
             elif ev.kind == "stage_complete" and data.get("stage") == 7 and data.get("pruned_graph"):
                 state["pruned_graph"] = _serialize(data["pruned_graph"])
+            elif ev.kind == "consensus_built" and data.get("consensus_graph"):
+                state["consensus_graph"] = _serialize(data["consensus_graph"])
             # Live status text comes from the most recent stage_start.
             if ev.kind == "stage_start":
                 state["current_stage"] = ev.message
@@ -280,6 +300,7 @@ def _empty_state() -> dict[str, Any]:
         "subtrees": {},
         "merged_graph": None,
         "pruned_graph": None,
+        "consensus_graph": None,
         "result": None,
         "request": None,
     }
@@ -364,6 +385,7 @@ def _serialize_pipeline_result(result: PipelineResult) -> dict[str, Any]:
         "tail_scenarios": [_serialize(s) for s in result.tail_scenarios],
         "citation_validations": dict(result.citation_validations),
         "link_applicabilities": {k: _serialize(v) for k, v in result.link_applicabilities.items()},
+        "consensus_graph": _serialize(result.consensus_graph) if result.consensus_graph else None,
         "run_id": result.run_id,
     }
 
@@ -393,6 +415,7 @@ def get_run(run_id: str) -> JSONResponse:
             "subtrees": dict(state["subtrees"]),
             "merged_graph": state["merged_graph"],
             "pruned_graph": state["pruned_graph"],
+            "consensus_graph": state.get("consensus_graph"),
             "result": state["result"],
         }
     return JSONResponse(snapshot)
