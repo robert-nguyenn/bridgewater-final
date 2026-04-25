@@ -957,6 +957,61 @@ def run_pipeline(
         pruned_graph=copy.deepcopy(graph),
     )
 
+    # Reconcile per-case-study subtree views with the post-prune merged graph.
+    # state.subtrees in the UI is populated during stage 3 build; nothing
+    # downstream updates it, so the multi-grid would otherwise show pre-prune
+    # subtrees (with edges that have since been dropped by applies-today,
+    # chain verify, or the pruner). For each cs, either:
+    #   - emit subtree_dropped_finalize: nothing of this cs survived → UI removes the cell
+    #   - emit subtree_finalized: rebuild a per-cs subview from the post-prune graph
+    #     (cs root + surviving descendants + bridges visualized as cs_root → child)
+    post_prune_node_ids = set(graph.nodes.keys())
+    for cs in case_studies:
+        cs_root_id = cs.subtree.root or _first_node_id(cs.subtree)
+        surviving_descendants = case_study_subtree_nodes.get(cs.id, set()) & post_prune_node_ids
+        if not surviving_descendants:
+            emit(
+                "subtree_dropped_finalize",
+                f"  Drop subtree {cs.name!r} from grid: nothing survived post-prune",
+                case_study_id=cs.id,
+                name=cs.name,
+            )
+            continue
+        view_nodes: dict[str, Node] = {}
+        if cs_root_id and cs_root_id in cs.subtree.nodes:
+            view_nodes[cs_root_id] = cs.subtree.nodes[cs_root_id]
+        for nid in surviving_descendants:
+            view_nodes[nid] = graph.nodes[nid]
+        view_edges: list[Edge] = []
+        for e in graph.edges:
+            if e.src in surviving_descendants and e.dst in surviving_descendants:
+                view_edges.append(e)
+            elif (
+                cs_root_id
+                and e.dst in surviving_descendants
+                and e.src not in surviving_descendants
+                and "historical analog" in (e.mechanism or "")
+            ):
+                view_edges.append(Edge(
+                    id=e.id,
+                    src=cs_root_id,
+                    dst=e.dst,
+                    mechanism=e.mechanism,
+                    sensitivity=e.sensitivity,
+                    confidence=e.confidence,
+                    supporting_data=list(e.supporting_data),
+                ))
+        finalized_graph = CausalGraph(
+            nodes=view_nodes, edges=view_edges, root=cs_root_id or None,
+        )
+        emit(
+            "subtree_finalized",
+            f"  Finalize {cs.name!r}: {len(view_nodes)} nodes, {len(view_edges)} edges",
+            case_study_id=cs.id,
+            name=cs.name,
+            subtree=copy.deepcopy(finalized_graph),
+        )
+
     # ------------------------------------------------------------------
     # Stage 9: Portfolio
     # ------------------------------------------------------------------
