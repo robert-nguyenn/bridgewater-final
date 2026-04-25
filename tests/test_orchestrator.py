@@ -4,7 +4,12 @@ from unittest.mock import MagicMock
 
 from src.agents.adversary import Critique
 from src.agents.defender import Rebuttal
-from src.orchestrator import Debate, run_adversarial_debate, run_pipeline
+from src.orchestrator import (
+    Debate,
+    PipelineResult,
+    run_adversarial_debate,
+    run_pipeline,
+)
 from src.types import CausalGraph, Edge, Node
 
 
@@ -22,9 +27,11 @@ def _msg(text: str) -> MagicMock:
     return m
 
 
-def test_orchestrator_dry_run():
-    g = run_pipeline("test event", dry_run=True)
-    assert isinstance(g, CausalGraph)
+def test_orchestrator_dry_run_returns_pipeline_result():
+    result = run_pipeline("test event", dry_run=True)
+    assert isinstance(result, PipelineResult)
+    assert isinstance(result.graph, CausalGraph)
+    assert result.graph.nodes == {}
 
 
 def test_debate_survives_property():
@@ -68,7 +75,6 @@ def test_run_adversarial_debate_calls_both_agents_per_edge():
 
     assert set(debates.keys()) == {"e_1", "e_2"}
     assert all(d.survives for d in debates.values())
-    # 2 edges * 2 agents per edge = 4 LLM calls
     assert fake_client.messages.create.call_count == 4
 
 
