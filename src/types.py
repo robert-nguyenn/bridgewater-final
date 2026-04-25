@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
 
 # Skeleton types. Integrator owns this file. Append-only after merge.
 # See CLAUDE.md "Key abstractions" for the contract.
+
+
+def _new_edge_id() -> str:
+    return f"e_{uuid.uuid4().hex[:8]}"
 
 
 @dataclass
@@ -34,6 +39,7 @@ class Edge:
     mechanism: str
     sensitivity: float
     confidence: float
+    id: str = field(default_factory=_new_edge_id)
     supporting_data: list[Evidence] = field(default_factory=list)
     adversary_notes: Optional[str] = None
 

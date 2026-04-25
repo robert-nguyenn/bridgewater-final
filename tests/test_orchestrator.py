@@ -1,9 +1,101 @@
 from __future__ import annotations
 
-from src.orchestrator import run_pipeline
-from src.types import CausalGraph
+from unittest.mock import MagicMock
+
+from src.agents.adversary import Critique
+from src.agents.defender import Rebuttal
+from src.orchestrator import Debate, run_adversarial_debate, run_pipeline
+from src.types import CausalGraph, Edge, Node
+
+
+def _node(nid: str, label: str, layer: int = 1) -> Node:
+    return Node(id=nid, label=label, description=f"{label} description", layer=layer)
+
+
+def _edge(src: str, dst: str, eid: str) -> Edge:
+    return Edge(src=src, dst=dst, mechanism="m", sensitivity=0.5, confidence=0.5, id=eid)
+
+
+def _msg(text: str) -> MagicMock:
+    m = MagicMock()
+    m.content = [MagicMock(text=text)]
+    return m
 
 
 def test_orchestrator_dry_run():
     g = run_pipeline("test event", dry_run=True)
     assert isinstance(g, CausalGraph)
+
+
+def test_debate_survives_property():
+    adv = Critique(target_id="x", counterargument="x", score=0.4)
+    df = Rebuttal(target_id="x", rebuttal="y", score=0.6)
+    d = Debate(target_id="x", critique=adv, rebuttal=df)
+    assert d.survives is True
+    assert abs(d.margin - 0.2) < 1e-9
+
+
+def test_debate_loses_when_adversary_outscores():
+    adv = Critique(target_id="x", counterargument="x", score=0.7)
+    df = Rebuttal(target_id="x", rebuttal="y", score=0.5)
+    d = Debate(target_id="x", critique=adv, rebuttal=df)
+    assert d.survives is False
+    assert d.margin < 0
+
+
+def test_debate_ties_go_to_defender():
+    adv = Critique(target_id="x", counterargument="x", score=0.5)
+    df = Rebuttal(target_id="x", rebuttal="y", score=0.5)
+    d = Debate(target_id="x", critique=adv, rebuttal=df)
+    assert d.survives is True
+
+
+def test_run_adversarial_debate_empty_graph():
+    assert run_adversarial_debate(CausalGraph()) == {}
+
+
+def test_run_adversarial_debate_calls_both_agents_per_edge():
+    nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
+    edges = [_edge("a", "b", "e_1"), _edge("a", "b", "e_2")]
+    graph = CausalGraph(nodes=nodes, edges=edges, root="a")
+
+    crit = _msg('```json\n{"target_id": "x", "counterargument": "weak", "score": 0.3}\n```')
+    reb = _msg('```json\n{"target_id": "x", "rebuttal": "strong", "score": 0.7}\n```')
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [crit, reb, crit, reb]
+
+    debates = run_adversarial_debate(graph, client=fake_client)
+
+    assert set(debates.keys()) == {"e_1", "e_2"}
+    assert all(d.survives for d in debates.values())
+    # 2 edges * 2 agents per edge = 4 LLM calls
+    assert fake_client.messages.create.call_count == 4
+
+
+def test_run_adversarial_debate_includes_nodes_when_requested():
+    nodes = {"a": _node("a", "A")}
+    graph = CausalGraph(nodes=nodes, edges=[], root="a")
+
+    crit = _msg('```json\n{"target_id": "a", "counterargument": "x", "score": 0.6}\n```')
+    reb = _msg('```json\n{"target_id": "a", "rebuttal": "y", "score": 0.4}\n```')
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [crit, reb]
+
+    debates = run_adversarial_debate(graph, include_nodes=True, client=fake_client)
+    assert "a" in debates
+    assert debates["a"].survives is False
+    assert abs(debates["a"].margin - (-0.2)) < 1e-9
+
+
+def test_run_adversarial_debate_uses_edge_id_as_key():
+    nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
+    edge = Edge(src="a", dst="b", mechanism="m", sensitivity=0.5, confidence=0.5, id="custom_id")
+    graph = CausalGraph(nodes=nodes, edges=[edge], root="a")
+
+    crit = _msg('```json\n{"target_id": "x", "counterargument": "x", "score": 0.4}\n```')
+    reb = _msg('```json\n{"target_id": "x", "rebuttal": "y", "score": 0.5}\n```')
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [crit, reb]
+
+    debates = run_adversarial_debate(graph, client=fake_client)
+    assert "custom_id" in debates
