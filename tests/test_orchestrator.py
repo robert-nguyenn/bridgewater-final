@@ -62,6 +62,7 @@ def test_run_adversarial_debate_empty_graph():
 
 
 def test_run_adversarial_debate_calls_both_agents_per_edge():
+    """Without the moderator, two LLM calls per edge (adversary + defender)."""
     nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
     edges = [_edge("a", "b", "e_1"), _edge("a", "b", "e_2")]
     graph = CausalGraph(nodes=nodes, edges=edges, root="a")
@@ -71,11 +72,35 @@ def test_run_adversarial_debate_calls_both_agents_per_edge():
     fake_client = MagicMock()
     fake_client.messages.create.side_effect = [crit, reb, crit, reb]
 
-    debates = run_adversarial_debate(graph, client=fake_client)
+    debates = run_adversarial_debate(graph, client=fake_client, use_moderator=False)
 
     assert set(debates.keys()) == {"e_1", "e_2"}
     assert all(d.survives for d in debates.values())
     assert fake_client.messages.create.call_count == 4
+    assert all(d.verdict is None for d in debates.values())
+
+
+def test_run_adversarial_debate_with_moderator():
+    """With the moderator, three LLM calls per edge (adversary + defender + moderator)."""
+    nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
+    edges = [_edge("a", "b", "e_1")]
+    graph = CausalGraph(nodes=nodes, edges=edges, root="a")
+
+    crit = _msg('```json\n{"target_id": "x", "counterargument": "weak", "score": 0.3}\n```')
+    reb = _msg('```json\n{"target_id": "x", "rebuttal": "strong", "score": 0.7}\n```')
+    mod = _msg('```json\n{"target_id": "e_1", "decision": "drop", "confidence_adjustment": -0.1, "reasoning": "adversary cited specifics"}\n```')
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [crit, reb, mod]
+
+    debates = run_adversarial_debate(graph, client=fake_client, use_moderator=True)
+
+    assert fake_client.messages.create.call_count == 3
+    d = debates["e_1"]
+    assert d.verdict is not None
+    assert d.verdict.decision == "drop"
+    # Moderator decision overrides score margin: defender outscored adversary
+    # but moderator says drop, so survives = False.
+    assert d.survives is False
 
 
 def test_run_adversarial_debate_includes_nodes_when_requested():
@@ -87,7 +112,9 @@ def test_run_adversarial_debate_includes_nodes_when_requested():
     fake_client = MagicMock()
     fake_client.messages.create.side_effect = [crit, reb]
 
-    debates = run_adversarial_debate(graph, include_nodes=True, client=fake_client)
+    debates = run_adversarial_debate(
+        graph, include_nodes=True, client=fake_client, use_moderator=False
+    )
     assert "a" in debates
     assert debates["a"].survives is False
     assert abs(debates["a"].margin - (-0.2)) < 1e-9
@@ -103,5 +130,5 @@ def test_run_adversarial_debate_uses_edge_id_as_key():
     fake_client = MagicMock()
     fake_client.messages.create.side_effect = [crit, reb]
 
-    debates = run_adversarial_debate(graph, client=fake_client)
+    debates = run_adversarial_debate(graph, client=fake_client, use_moderator=False)
     assert "custom_id" in debates

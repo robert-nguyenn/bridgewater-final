@@ -143,6 +143,105 @@ def test_sensitivity_caps_confidence_when_no_data(monkeypatch):
     assert result.confidence <= sensitivity.PRIORS_ONLY_CAP
 
 
+def test_sensitivity_logic_pass_floors_confidence(monkeypatch):
+    """When the LogicVerifier passes, confidence is floored at LOGIC_PASS_FLOOR
+    even with no empirical data."""
+    refs = json.dumps({"fred_series": [], "tickers": [], "reasoning": "."})
+    score = json.dumps(
+        {
+            "sensitivity": 0.4,
+            "confidence": 0.25,  # would normally be capped at 0.3 priors-only
+            "mechanism_refined": "asserted",
+            "supporting_data": [],
+            "magnitude_estimate": None,
+            "keep": True,
+            "keep_reason": "passes logic but no data",
+        }
+    )
+    monkeypatch.setattr(sensitivity, "_call_model", queue_stub([refs, score]))
+
+    parent = Node(id="p", label="x", description="x", layer=0)
+    cand = Node(id="c", label="y", description="y", layer=1)
+    tools = ToolBundle(fred=StubFRED({}))
+
+    def logic_passes(_p, _c, _m):
+        return {"ok": True, "reason": "valid local inference"}
+
+    result = sensitivity.score_edge(
+        parent, cand, "...", make_case_study(),
+        tools=tools, model="m", logic_check=logic_passes,
+    )
+    assert result.confidence == pytest.approx(sensitivity.LOGIC_PASS_FLOOR)
+    assert result.keep is True
+    assert any(ev.kind == "logic_check" and "passed" in (ev.note or "") for ev in result.supporting_data)
+
+
+def test_sensitivity_logic_fail_caps_confidence_and_drops(monkeypatch):
+    """When the LogicVerifier fails, confidence is capped at LOGIC_FAIL_CAP
+    and the edge is marked drop."""
+    refs = json.dumps({"fred_series": ["DTWEXBGS"], "tickers": [], "reasoning": "."})
+    score = json.dumps(
+        {
+            "sensitivity": 0.7,
+            "confidence": 0.85,  # high empirical confidence
+            "mechanism_refined": "tight quantitative link",
+            "supporting_data": [
+                {"series_id": "DTWEXBGS", "peak_z": 3.0, "interpretation": "spike"}
+            ],
+            "magnitude_estimate": -0.05,
+            "keep": True,
+            "keep_reason": "tight link",
+        }
+    )
+    monkeypatch.setattr(sensitivity, "_call_model", queue_stub([refs, score]))
+
+    parent = Node(id="p", label="x", description="x", layer=0)
+    cand = Node(id="c", label="y", description="y", layer=1)
+    fred = StubFRED({"DTWEXBGS": make_series([100.0] * 30 + [120.0] * 50)})
+    tools = ToolBundle(fred=fred)
+
+    def logic_fails(_p, _c, _m):
+        return {"ok": False, "reason": "mechanism_mismatch: USD does not directly affect Y"}
+
+    result = sensitivity.score_edge(
+        parent, cand, "USD weakens Y", make_case_study(),
+        tools=tools, model="m", logic_check=logic_fails,
+    )
+    assert result.confidence <= sensitivity.LOGIC_FAIL_CAP
+    assert result.keep is False
+    assert "logic check failed" in result.keep_reason
+
+
+def test_sensitivity_logic_check_unavailable_falls_back_to_priors_cap(monkeypatch):
+    """If logic_check returns None, sensitivity falls back to PRIORS_ONLY_CAP."""
+    refs = json.dumps({"fred_series": [], "tickers": [], "reasoning": "."})
+    score = json.dumps(
+        {
+            "sensitivity": 0.5,
+            "confidence": 0.85,
+            "mechanism_refined": "asserted",
+            "supporting_data": [],
+            "magnitude_estimate": None,
+            "keep": True,
+            "keep_reason": "...",
+        }
+    )
+    monkeypatch.setattr(sensitivity, "_call_model", queue_stub([refs, score]))
+
+    parent = Node(id="p", label="x", description="x", layer=0)
+    cand = Node(id="c", label="y", description="y", layer=1)
+    tools = ToolBundle(fred=StubFRED({}))
+
+    def logic_unavailable(_p, _c, _m):
+        return None  # check could not run
+
+    result = sensitivity.score_edge(
+        parent, cand, "...", make_case_study(),
+        tools=tools, model="m", logic_check=logic_unavailable,
+    )
+    assert result.confidence <= sensitivity.PRIORS_ONLY_CAP
+
+
 def test_sensitivity_records_tool_errors(monkeypatch):
     refs = json.dumps({"fred_series": ["MISSING"], "tickers": [], "reasoning": "."})
     score = json.dumps(

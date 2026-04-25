@@ -5,11 +5,12 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import networkx as nx
 
 from src.agents import sensitivity as sensitivity_agent
+from src.agents.sensitivity import LogicCheck
 from src.config import LOGS_DIR, MODEL, MODEL_FAST, PROMPTS_DIR
 from src.types import (
     CaseStudy,
@@ -228,6 +229,7 @@ def build_subtree(
     model_fast: str = MODEL_FAST,
     max_layers: int = DEFAULT_MAX_LAYERS,
     max_nodes: int = DEFAULT_MAX_NODES,
+    logic_check: Optional[LogicCheck] = None,
     run_id: Optional[str] = None,
 ) -> CaseStudy:
     """Expand a CaseStudy's triggering event into a 2 to 3 layer DAG.
@@ -281,6 +283,7 @@ def build_subtree(
                     case_study=case_study,
                     tools=tools,
                     model=model,
+                    logic_check=logic_check,
                     run_id=run_id,
                 )
                 if not score.keep:

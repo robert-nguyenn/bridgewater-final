@@ -139,4 +139,69 @@ def render_graphviz(graph: CausalGraph, out_path: Path) -> Path:
     return Path(rendered)
 
 
-__all__ = ["to_networkx", "render_pyvis", "render_graphviz", "LAYER_COLORS"]
+def _layered_layout(nx_g) -> dict:
+    """Top-down tree layout. Layer 0 at the top, deeper layers below."""
+    layer_nodes: dict[int, list] = {}
+    for n in nx_g.nodes:
+        layer = nx_g.nodes[n].get("layer", 0) or 0
+        layer_nodes.setdefault(layer, []).append(n)
+
+    pos: dict = {}
+    max_layer = max(layer_nodes) if layer_nodes else 0
+    for layer, nodes in layer_nodes.items():
+        y = 1.0 - (layer / max(max_layer, 1))
+        nodes_sorted = sorted(nodes)
+        n = len(nodes_sorted)
+        for i, node in enumerate(nodes_sorted):
+            x = (i + 0.5) / max(n, 1)
+            pos[node] = (x, y)
+    return pos
+
+
+def render_matplotlib(graph: CausalGraph, *, title: Optional[str] = None, figsize=(10.0, 6.0)):
+    """Render a CausalGraph as a static matplotlib figure for fast inline display.
+
+    Used for live progress updates during a pipeline run, where pyvis is too
+    heavy. Returns a `matplotlib.figure.Figure`, or None if the graph is empty.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(f"matplotlib not installed: {exc}") from exc
+    import networkx as nx
+
+    nx_g = to_networkx(graph)
+    if nx_g.number_of_nodes() == 0:
+        return None
+
+    pos = _layered_layout(nx_g)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    colors = [_node_color(nx_g.nodes[n].get("layer", 0)) for n in nx_g.nodes]
+    sizes = [600 + 80 * (nx_g.in_degree(n) + nx_g.out_degree(n)) for n in nx_g.nodes]
+    labels = {n: (nx_g.nodes[n].get("label", n) or n)[:24] for n in nx_g.nodes}
+
+    nx.draw_networkx_nodes(
+        nx_g, pos, ax=ax, node_color=colors, node_size=sizes, alpha=0.9, edgecolors="white"
+    )
+    nx.draw_networkx_labels(nx_g, pos, ax=ax, labels=labels, font_size=7, font_color="white")
+    nx.draw_networkx_edges(
+        nx_g, pos, ax=ax,
+        arrows=True, edge_color="#777", width=1.0, arrowsize=10, alpha=0.7,
+        connectionstyle="arc3,rad=0.05",
+    )
+
+    if title:
+        ax.set_title(title, fontsize=11)
+    ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+__all__ = [
+    "to_networkx",
+    "render_pyvis",
+    "render_graphviz",
+    "render_matplotlib",
+    "LAYER_COLORS",
+]

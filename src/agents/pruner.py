@@ -1,22 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from src.types import CausalGraph, Edge, ToolBundle
+
+PrunerEventCallback = Callable[[dict[str, Any]], None]
 
 
 def run(
     graph: CausalGraph,
     *,
-    debates: Optional[dict[str, Any]] = None,  # edge_id -> Debate
-    comparator: Optional[dict[str, float]] = None,  # case_study_name -> similarity
-    case_study_subtree_roots: Optional[dict[str, str]] = None,  # case_study_name -> subtree_root_id
+    debates: Optional[dict[str, Any]] = None,
+    comparator: Optional[dict[str, float]] = None,
+    case_study_subtree_roots: Optional[dict[str, str]] = None,
     debate_margin_threshold: float = 0.0,
     similarity_threshold: float = 0.3,
     tools: Optional[ToolBundle] = None,
     model: str = "",
     client: Any = None,
     run_id: Optional[str] = None,
+    on_event: Optional[PrunerEventCallback] = None,
 ) -> CausalGraph:
     """Prune edges that lost their adversarial debate and case-study subtrees
     whose macro regime is too far from today.
@@ -27,34 +30,76 @@ def run(
        (cuts the subtree root and everything reachable only through it).
     3. Garbage-collect nodes no longer reachable from the graph root.
 
-    The graph root is always preserved. Pure structural pruning; no LLM call.
-    `tools`, `model`, `client`, `run_id` kept for canonical agent shape.
+    `on_event`, if provided, receives a dict per pruning decision so a UI can
+    stream the process. Event kinds: `edge_pruned`, `subtree_dropped`,
+    `node_orphaned`, `pruning_summary`.
     """
     debates = debates or {}
     comparator = comparator or {}
     case_study_subtree_roots = case_study_subtree_roots or {}
 
-    # 1. Drop edges that lost the debate.
+    def emit(kind: str, **data: Any) -> None:
+        if on_event is not None:
+            on_event({"kind": kind, **data})
+
+    # 1. Edge debate filter. Moderator verdict wins when present; otherwise
+    # fall back to the score-margin rule.
     surviving_edges: list[Edge] = []
     for edge in graph.edges:
         debate = debates.get(edge.id)
         if debate is not None:
+            verdict = getattr(debate, "verdict", None)
             margin = debate.rebuttal.score - debate.critique.score
-            if margin < debate_margin_threshold:
+            should_drop = False
+            reason = ""
+            if verdict is not None:
+                if verdict.decision == "drop":
+                    should_drop = True
+                    reason = "moderator_dropped"
+            else:
+                if margin < debate_margin_threshold:
+                    should_drop = True
+                    reason = "lost_debate"
+            if should_drop:
+                src_label = graph.nodes[edge.src].label if edge.src in graph.nodes else edge.src
+                dst_label = graph.nodes[edge.dst].label if edge.dst in graph.nodes else edge.dst
+                emit(
+                    "edge_pruned",
+                    edge_id=edge.id,
+                    src=edge.src,
+                    dst=edge.dst,
+                    src_label=src_label,
+                    dst_label=dst_label,
+                    mechanism=edge.mechanism,
+                    reason=reason,
+                    adversary_score=debate.critique.score,
+                    defender_score=debate.rebuttal.score,
+                    margin=margin,
+                    moderator_reasoning=getattr(verdict, "reasoning", None) if verdict else None,
+                )
                 continue
         surviving_edges.append(edge)
 
-    # 2. Identify nodes inside case-study subtrees that fail the similarity gate.
+    # 2. Subtree similarity filter.
     excluded: set[str] = set()
-    for cs_name, similarity in comparator.items():
+    for cs_key, similarity in comparator.items():
         if similarity >= similarity_threshold:
             continue
-        subtree_root = case_study_subtree_roots.get(cs_name)
+        subtree_root = case_study_subtree_roots.get(cs_key)
         if not subtree_root:
             continue
-        excluded |= _reachable_from(subtree_root, surviving_edges)
+        subtree_nodes = _reachable_from(subtree_root, surviving_edges)
+        excluded |= subtree_nodes
+        emit(
+            "subtree_dropped",
+            case_study=cs_key,
+            subtree_root=subtree_root,
+            similarity=similarity,
+            threshold=similarity_threshold,
+            n_nodes=len(subtree_nodes),
+        )
 
-    # 3. Garbage-collect nodes no longer reachable from the root, skipping excluded.
+    # 3. Reachability GC.
     if graph.root and graph.root in graph.nodes:
         reachable = _reachable_from(
             graph.root, surviving_edges, excluded=excluded
@@ -65,13 +110,31 @@ def run(
     pruned_nodes = {nid: n for nid, n in graph.nodes.items() if nid in reachable}
     pruned_edges = [e for e in surviving_edges if e.src in reachable and e.dst in reachable]
 
+    orphans = set(graph.nodes) - reachable - excluded
+    for orphan_id in orphans:
+        emit(
+            "node_orphaned",
+            node_id=orphan_id,
+            label=graph.nodes[orphan_id].label,
+            reason="no path from root after edge filter",
+        )
+
+    emit(
+        "pruning_summary",
+        nodes_in=len(graph.nodes),
+        nodes_out=len(pruned_nodes),
+        edges_in=len(graph.edges),
+        edges_out=len(pruned_edges),
+        edges_dropped=len(graph.edges) - len(pruned_edges),
+        nodes_dropped=len(graph.nodes) - len(pruned_nodes),
+    )
+
     return CausalGraph(nodes=pruned_nodes, edges=pruned_edges, root=graph.root)
 
 
 def _reachable_from(
     start: str, edges: list[Edge], *, excluded: Optional[set[str]] = None
 ) -> set[str]:
-    """All nodes reachable from `start` via `edges`, optionally skipping `excluded`."""
     excluded = excluded or set()
     if start in excluded:
         return set()

@@ -62,6 +62,10 @@ class CausalGraph:
     root: Optional[str] = None
 
 
+def _new_case_study_id() -> str:
+    return f"cs_{uuid.uuid4().hex[:8]}"
+
+
 @dataclass
 class CaseStudy:
     name: str
@@ -70,6 +74,7 @@ class CaseStudy:
     macro_snapshot: MacroSnapshot
     similarity_score: float
     subtree: CausalGraph
+    id: str = field(default_factory=_new_case_study_id)
 
 
 @dataclass

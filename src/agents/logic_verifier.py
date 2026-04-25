@@ -8,6 +8,7 @@ from src.config import ANTHROPIC_API_KEY, MODEL, PROMPTS_DIR
 from src.types import Edge, Node, ToolBundle
 
 FAILURE_CATEGORIES = {
+    # Chain-validity failures
     "hidden_assumption",
     "mechanism_mismatch",
     "magnitude_leap",
@@ -16,6 +17,14 @@ FAILURE_CATEGORIES = {
     "missing_step",
     "sign_inconsistency",
     "score_evidence_mismatch",
+    # Common LLM reasoning failures the verifier explicitly catches
+    "reverse_causation",        # X→Y claimed when actual direction is Y→X
+    "spurious_correlation",     # cites co-movement without a named mechanism
+    "selection_bias",           # cites only confirming episodes, ignores misses
+    "base_rate_neglect",        # extrapolates from one episode, ignores priors
+    "fabricated_evidence",      # cites series/tickers/episodes that don't exist
+    "levels_confusion",         # micro effect inflated to macro (or vice versa)
+    "affirming_consequent",     # from "A→B" and "B observed", claims "A"
 }
 
 

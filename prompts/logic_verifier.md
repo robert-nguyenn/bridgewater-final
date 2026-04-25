@@ -36,12 +36,27 @@ Look across adjacent steps:
 - **Horizon.** Do consecutive steps live on compatible horizons? A `short`-horizon step feeding a `long`-horizon step with no buffering mechanism is a fail.
 - **Missing transmission.** Are there obviously skipped intermediate variables that should have been their own nodes?
 
+## Pass 3.5: Common LLM reasoning failures
+
+Before deciding, also check for these failure modes that LLMs frequently produce in macro/finance chains. Each is a fail on its own:
+
+- **Reverse causation.** The chain claims A → B when the literature / common sense / the cited episodes actually have causation running B → A (or both directions ambiguous). E.g., "stock prices rise → consumer confidence rises" reverses the more commonly studied direction.
+- **Spurious correlation.** A step cites that two variables historically co-moved without naming the mechanism that produces the link. Co-movement without mechanism is not causation.
+- **Selection bias.** A step cites only the episodes where the link held and ignores episodes where the same setup did not produce the same result.
+- **Base rate neglect.** A step extrapolates from one episode without acknowledging how often the link actually holds. "In 2008 X happened" is not "X happens whenever the setup recurs."
+- **Fabricated evidence.** A cited FRED series ID, ticker, or episode date does not actually exist or doesn't say what the chain claims it says. Flag if you suspect this; do not cite it as failed unless you are confident.
+- **Levels confusion.** Micro-level effect (one firm, one trade, one rate decision) claimed to scale to macro effect (entire index, entire economy) without a named aggregation mechanism. Or vice versa.
+- **Affirming the consequent.** From "A causes B" and "B was observed", the chain concludes "A happened." This is a logic error: B can have many causes.
+
+These failures often coexist with the chain-validity failures from Pass 3. If a step has multiple failure modes, pick the most diagnostic one in Pass 4.
+
 ## Pass 4: Decide and categorize
 
-If everything in passes 2 and 3 passes, set `ok = true`.
+If everything in passes 2, 3, and 3.5 passes, set `ok = true`.
 
 Otherwise set `ok = false`, identify the **earliest** failing step by `edge_idx`, and assign exactly one `failure_category` from this enum:
 
+**Chain-validity failures:**
 - `hidden_assumption` — an unstated precondition is doing the work
 - `mechanism_mismatch` — the named mechanism does not actually link source to destination
 - `magnitude_leap` — magnitude jumps without an amplifier
@@ -50,7 +65,16 @@ Otherwise set `ok = false`, identify the **earliest** failing step by `edge_idx`
 - `missing_step` — a required intermediate variable is skipped
 - `sign_inconsistency` — signs across steps do not compose
 
-Be strict but specific. "Could be wrong" or "depends on conditions" is not a failure. Either name the actual missing assumption / shifted term / skipped variable, or pass.
+**LLM reasoning failures (Pass 3.5):**
+- `reverse_causation` — the chain has the causal direction backward
+- `spurious_correlation` — co-movement cited without a named mechanism
+- `selection_bias` — only confirming episodes cited
+- `base_rate_neglect` — single episode generalized without priors
+- `fabricated_evidence` — cited series/ticker/episode does not exist
+- `levels_confusion` — micro inflated to macro (or vice versa)
+- `affirming_consequent` — observing the consequent does not prove the antecedent
+
+Be strict but specific. "Could be wrong" or "depends on conditions" is not a failure. Either name the actual issue, or pass.
 
 ## Output format
 

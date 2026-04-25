@@ -80,18 +80,18 @@ def _build_user_message(
     seed_event: str,
     buckets: dict[str, list[Node]],
     edge_stats: dict[str, dict[str, float]],
+    portfolio_context: str = "",
 ) -> str:
-    return json.dumps(
-        {
-            "seed_event": seed_event,
-            "terminals_by_class": {
-                cls: [_node_payload(n) for n in nodes] for cls, nodes in buckets.items()
-            },
-            "edge_stats_by_node": edge_stats,
+    payload: dict[str, Any] = {
+        "seed_event": seed_event,
+        "terminals_by_class": {
+            cls: [_node_payload(n) for n in nodes] for cls, nodes in buckets.items()
         },
-        ensure_ascii=False,
-        default=str,
-    )
+        "edge_stats_by_node": edge_stats,
+    }
+    if portfolio_context.strip():
+        payload["portfolio_context"] = portfolio_context.strip()
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 SUBMIT_TOOL = {
@@ -211,6 +211,7 @@ def run(
     model: str,
     graph: Optional[CausalGraph] = None,
     seed_event: str = "",
+    portfolio_context: str = "",
     client: Any = None,  # injectable for tests
 ) -> list[PortfolioImpact]:
     """Translate terminal nodes into per asset class portfolio impacts.
@@ -246,7 +247,7 @@ def run(
         client = Anthropic()
 
     system_prompt = _load_prompt()
-    user_message = _build_user_message(seed_event, buckets, edge_stats)
+    user_message = _build_user_message(seed_event, buckets, edge_stats, portfolio_context)
 
     response = client.messages.create(
         model=model,

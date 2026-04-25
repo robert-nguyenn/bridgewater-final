@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Policy Impact Scenario Mapper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --bg-2: #111418;
+    --panel: #161b20;
+    --border: #232a30;
+    --text: #d8dde4;
+    --muted: #7a858f;
+    --accent: #d4a64a;
+    --pos: #4fb47a;
+    --neg: #d35d5d;
+    --first: #c879e3;
+    --info: #6ea5c9;
+    --layer0: #e63946;
+    --layer1: #f4a261;
+    --layer2: #2a9d8f;
+    --layer3: #264653;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  header {
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--bg-2); display: flex; align-items: center; gap: 16px;
+  }
+  header .title { font-weight: 600; letter-spacing: 0.5px; }
+  header .title span { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 11px; }
+  main { display: grid; grid-template-columns: 360px 1fr 380px; height: calc(100vh - 50px); }
+  .left, .right { border-right: 1px solid var(--border); overflow-y: auto; background: var(--panel); }
+  .right { border-right: none; border-left: 1px solid var(--border); }
+  .center { position: relative; overflow: hidden; background: var(--bg); }
+
+  .pane { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .pane h3 { margin: 0 0 8px 0; font-size: 11px; letter-spacing: 1px;
+             text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .pane small { color: var(--muted); font-size: 11px; }
+
+  textarea, input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 8px; font-family: inherit; font-size: 12px; resize: vertical;
+  }
+  textarea { min-height: 90px; }
+  button {
+    background: var(--accent); color: #000; border: none; padding: 7px 14px;
+    font-family: inherit; font-weight: 600; cursor: pointer; font-size: 12px;
+    border-radius: 3px;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { background: var(--border); color: var(--muted); cursor: wait; }
+
+  .param-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;
+  }
+  .param label {
+    display: block; color: var(--muted); font-size: 10px; letter-spacing: 0.5px;
+    text-transform: uppercase; margin-bottom: 3px;
+  }
+  .param input { width: 100%; }
+  .param small { display: block; color: var(--muted); font-size: 10px;
+                 margin-top: 3px; line-height: 1.3; }
+
+  .events { list-style: none; margin: 0; padding: 0; font-size: 11px; max-height: 280px; overflow-y: auto; }
+  .events li { padding: 2px 0; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+  .events li.kind-stage_start { color: var(--accent); margin-top: 4px; }
+  .events li.kind-stage_complete { color: var(--pos); }
+  .events li.kind-stage_failed { color: var(--neg); }
+  .events li.kind-edge_pruned { color: var(--neg); }
+  .events li.kind-subtree_dropped { color: var(--neg); }
+  .events li.kind-subtree_attached { color: var(--pos); }
+  .events li.kind-debate_complete { color: var(--info); }
+
+  .run-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+  .run-list li { padding: 6px 0; border-bottom: 1px dotted var(--border); cursor: pointer; }
+  .run-list li:hover { color: var(--accent); }
+  .run-list .rid { color: var(--muted); font-size: 10px; }
+
+  svg { width: 100%; height: 100%; display: block; }
+  .node circle { stroke: white; stroke-width: 1.5; }
+  .node.is-root circle { stroke-width: 2.5; }
+  .node text { fill: var(--text); font-size: 10px; pointer-events: none; }
+
+  .link { fill: none; cursor: pointer; }
+  .link.first { stroke-dasharray: 6 4; }
+  .link:hover { stroke-width: 5 !important; }
+
+  .drawer { padding: 14px 16px; }
+  .drawer h2 { margin: 0 0 2px 0; font-size: 13px; }
+  .drawer .sub { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
+  .row { display: flex; justify-content: space-between; gap: 10px;
+         padding: 4px 0; border-bottom: 1px dotted var(--border); font-size: 11px; }
+  .row .k { color: var(--muted); }
+  .row .v { color: var(--text); font-variant-numeric: tabular-nums; }
+  .row .v.pos { color: var(--pos); }
+  .row .v.neg { color: var(--neg); }
+  .badge { display: inline-block; padding: 2px 6px; border-radius: 2px;
+           font-size: 10px; color: #000; font-weight: 600;
+           background: var(--accent); margin-left: 6px; }
+  .badge.first { background: var(--first); color: #fff; }
+  .badge.dropped { background: var(--neg); color: #fff; }
+
+  .quote { border-left: 2px solid var(--border); padding: 4px 10px;
+           margin: 6px 0; color: var(--text); font-size: 11px; line-height: 1.4; }
+  .quote .who { color: var(--muted); font-weight: 600; font-size: 10px;
+                text-transform: uppercase; letter-spacing: 0.5px; }
+
+  .stage-tag {
+    display: inline-block; background: var(--bg-2); border: 1px solid var(--border);
+    color: var(--accent); padding: 2px 8px; font-size: 10px; border-radius: 2px;
+    margin-bottom: 6px; letter-spacing: 0.5px;
+  }
+
+  .loading { position: absolute; inset: 0; background: rgba(11,13,16,0.78);
+             display: flex; align-items: center; justify-content: center;
+             flex-direction: column; gap: 10px; z-index: 10;
+             color: var(--accent); font-size: 12px; }
+  .spinner { width: 24px; height: 24px; border: 2px solid var(--border);
+             border-top-color: var(--accent); border-radius: 50%;
+             animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">policy<span> impact mapper</span></div>
+  <div class="meta" id="status-meta">idle</div>
+</header>
+<main>
+  <aside class="left">
+    <div class="pane">
+      <h3>Event</h3>
+      <textarea id="event" placeholder="e.g. 25% tariff on Chinese semiconductors">25% tariff on Chinese semiconductors</textarea>
+      <small style="display: block; margin-top: 4px;">Plain-English policy event. Feeds IdeaAgent and ScenarioAgent.</small>
+      <div class="param-grid">
+        <div class="param">
+          <label>First-order nodes</label>
+          <input id="max-fo" type="number" min="2" max="8" value="4" />
+          <small>Top-level effects from IdeaAgent (max).</small>
+        </div>
+        <div class="param">
+          <label>Analogs / node</label>
+          <input id="max-analogs" type="number" min="1" max="6" value="4" />
+          <small>Historical case studies attached per first-order node.</small>
+        </div>
+      </div>
+      <div style="margin-top: 12px;">
+        <button id="run-btn">Run analysis</button>
+        <small id="time-note" style="margin-left: 8px;"></small>
+      </div>
+    </div>
+    <div class="pane">
+      <h3>Portfolio context (optional)</h3>
+      <textarea id="portfolio" placeholder="e.g. Long NVDA, SOXX, ASML. Short DXY. 60/40 with EM tilt." style="min-height: 60px;"></textarea>
+      <small style="display: block; margin-top: 4px;">Hint to PortfolioAgent. Surfaces tickers relevant to your holdings and names offsets that hedge them.</small>
+    </div>
+    <div class="pane">
+      <h3>Live progress</h3>
+      <ul class="events" id="events"></ul>
+    </div>
+    <div class="pane">
+      <h3>Recent runs</h3>
+      <ul class="run-list" id="runs"></ul>
+    </div>
+  </aside>
+
+  <section class="center">
+    <div id="loading" class="loading" style="display:none;">
+      <div class="spinner"></div>
+      <div id="loading-text">starting...</div>
+    </div>
+    <div id="stage-tag" class="stage-tag" style="position: absolute; top: 12px; left: 12px; z-index: 5; display: none;"></div>
+    <svg id="graph"></svg>
+  </section>
+
+  <aside class="right">
+    <div id="drawer" class="drawer">
+      <div class="sub">Click a node or edge for details. Adversary transcripts and case-study comparator distances appear here.</div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const API = "";
+const EventEl = document.getElementById("event");
+const PortfolioEl = document.getElementById("portfolio");
+const MaxFoEl = document.getElementById("max-fo");
+const MaxAnalogsEl = document.getElementById("max-analogs");
+const RunBtn = document.getElementById("run-btn");
+const EventsEl = document.getElementById("events");
+const RunsEl = document.getElementById("runs");
+const StatusMetaEl = document.getElementById("status-meta");
+const DrawerEl = document.getElementById("drawer");
+const LoadingEl = document.getElementById("loading");
+const LoadingTextEl = document.getElementById("loading-text");
+const StageTagEl = document.getElementById("stage-tag");
+const SVG = d3.select("#graph");
+
+let currentRunId = null;
+let currentResult = null;
+let pollTimer = null;
+let lastEventCount = 0;
+
+async function fetchJson(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+async function loadRuns() {
+  try {
+    const { runs } = await fetchJson("/api/runs");
+    RunsEl.innerHTML = "";
+    runs.slice(0, 12).forEach(r => {
+      const li = document.createElement("li");
+      li.innerHTML = `<div>${escapeHtml(r.event || "(no event)")}</div>
+                      <div class="rid">${r.run_id} · ${r.state}</div>`;
+      li.onclick = () => loadRun(r.run_id);
+      RunsEl.appendChild(li);
+    });
+    if (!RunsEl.children.length) RunsEl.innerHTML = "<small>no runs yet</small>";
+  } catch (e) { console.error(e); }
+}
+
+async function loadRun(runId) {
+  currentRunId = runId;
+  StatusMetaEl.textContent = `run ${runId}`;
+  lastEventCount = 0;
+  EventsEl.innerHTML = "";
+  pollOnce();
+}
+
+async function startRun() {
+  const event = EventEl.value.trim();
+  if (!event) { alert("enter an event"); return; }
+  RunBtn.disabled = true;
+  LoadingEl.style.display = "flex";
+  LoadingTextEl.textContent = "queuing...";
+  EventsEl.innerHTML = "";
+  lastEventCount = 0;
+  DrawerEl.innerHTML = '<div class="sub">running...</div>';
+
+  try {
+    const body = {
+      event,
+      portfolio_context: (PortfolioEl.value || "").trim(),
+      max_first_order: parseInt(MaxFoEl.value, 10) || 4,
+      max_analogs_per_node: parseInt(MaxAnalogsEl.value, 10) || 4,
+    };
+    const { run_id } = await fetchJson("/api/analyze", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    currentRunId = run_id;
+    StatusMetaEl.textContent = `run ${run_id} (live)`;
+    pollLoop();
+  } catch (e) {
+    alert("failed to start: " + e.message);
+    RunBtn.disabled = false;
+    LoadingEl.style.display = "none";
+  }
+}
+
+function pollLoop() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  const t0 = Date.now();
+  let backoff = 1500;
+  let inflight = false;
+
+  async function tick() {
+    if (inflight) { pollTimer = setTimeout(tick, 800); return; }
+    inflight = true;
+    try {
+      const data = await fetchJson(`/api/runs/${currentRunId}`);
+      ingestState(data);
+      const secs = Math.round((Date.now() - t0) / 1000);
+      LoadingTextEl.textContent = (data.current_stage || "starting") + ` · ${secs}s`;
+      const state = data.status?.state;
+      if (state === "done") {
+        LoadingEl.style.display = "none";
+        RunBtn.disabled = false;
+        loadRuns();
+        return;
+      }
+      if (state === "failed") {
+        LoadingEl.style.display = "none";
+        RunBtn.disabled = false;
+        alert("run failed: " + (data.status.error || "unknown"));
+        return;
+      }
+      if (secs > 60) backoff = 4000;
+      else if (secs > 20) backoff = 2500;
+      else backoff = 1500;
+    } catch (e) {
+      console.error("poll error", e);
+      backoff = Math.min(backoff * 1.5, 8000);
+    } finally {
+      inflight = false;
+    }
+    pollTimer = setTimeout(tick, backoff);
+  }
+  tick();
+}
+
+function pollOnce() {
+  if (!currentRunId) return;
+  fetchJson(`/api/runs/${currentRunId}`).then(ingestState).catch(console.error);
+}
+
+function ingestState(data) {
+  // Append new events to the live log.
+  const events = data.events || [];
+  for (let i = lastEventCount; i < events.length; i++) {
+    const ev = events[i];
+    const li = document.createElement("li");
+    li.className = "kind-" + ev.kind;
+    li.textContent = ev.message;
+    EventsEl.appendChild(li);
+    EventsEl.scrollTop = EventsEl.scrollHeight;
+  }
+  lastEventCount = events.length;
+
+  // Pick the freshest graph snapshot to render.
+  let g = null, tag = null;
+  if (data.pruned_graph) { g = data.pruned_graph; tag = "PRUNED"; }
+  else if (data.merged_graph) { g = data.merged_graph; tag = "MERGED (pre-prune)"; }
+  else if (data.trunk) { g = data.trunk; tag = "TRUNK + first-order"; }
+
+  if (g) {
+    StageTagEl.style.display = "inline-block";
+    StageTagEl.textContent = tag;
+    renderGraph(g, data);
+  }
+
+  if (data.result) {
+    currentResult = data.result;
+    if (!DrawerEl.dataset.locked) renderOverviewDrawer();
+  }
+}
+
+// =================================================================
+// D3 rendering
+// =================================================================
+
+function renderGraph(graph, state) {
+  SVG.selectAll("*").remove();
+  const bbox = SVG.node().getBoundingClientRect();
+  const W = bbox.width, H = bbox.height;
+  const nodes = Object.values(graph.nodes || {});
+  const edges = (graph.edges || []).filter(e => graph.nodes[e.src] && graph.nodes[e.dst]);
+  if (!nodes.length) return;
+
+  // Layered layout: nodes grouped by `layer`, columns spaced left to right.
+  const byLayer = d3.group(nodes, n => n.layer || 0);
+  const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
+  const colW = W / (layers.length + 1);
+  const idToNode = new Map();
+  layers.forEach((layer, idx) => {
+    const list = byLayer.get(layer);
+    list.forEach((n, i) => {
+      n._x = colW * (idx + 1);
+      n._y = (H / (list.length + 1)) * (i + 1);
+      idToNode.set(n.id, n);
+    });
+  });
+
+  // Edges
+  const linkColor = (e) => {
+    const sens = e.sensitivity || 0;
+    if (sens > 0.6) return "var(--pos)";
+    if (sens < 0.3) return "var(--muted)";
+    return "var(--info)";
+  };
+  const linkWidth = (e) => 1 + 4 * (e.sensitivity || 0);
+  const linkOpacity = (e) => 0.3 + 0.7 * (e.confidence || 0);
+
+  const linkGroup = SVG.append("g").attr("class", "links");
+  linkGroup.selectAll("path").data(edges).join("path")
+    .attr("class", e => "link" + (e.src === graph.root ? " first" : ""))
+    .attr("stroke", e => {
+      const surv = state.result?.debates?.[e.id]?.survives;
+      if (surv === false) return "var(--neg)";
+      return linkColor(e);
+    })
+    .attr("stroke-width", linkWidth)
+    .attr("stroke-opacity", linkOpacity)
+    .attr("d", e => curve(idToNode.get(e.src), idToNode.get(e.dst)))
+    .on("click", (ev, e) => renderEdgeDrawer(e, graph, state))
+    .append("title").text(e => `${idToNode.get(e.src)?.label} -> ${idToNode.get(e.dst)?.label}\nmechanism: ${e.mechanism}\nsensitivity: ${(e.sensitivity || 0).toFixed(2)}\nconfidence: ${(e.confidence || 0).toFixed(2)}`);
+
+  // Nodes
+  const nodeGroup = SVG.append("g").attr("class", "nodes");
+  const nodeSel = nodeGroup.selectAll("g").data(nodes).join("g")
+    .attr("class", n => "node" + (n.id === graph.root ? " is-root" : ""))
+    .attr("transform", n => `translate(${n._x},${n._y})`)
+    .on("click", (ev, n) => renderNodeDrawer(n, state));
+
+  nodeSel.append("circle")
+    .attr("r", n => n.id === graph.root ? 10 : 7)
+    .attr("fill", n => layerColor(n.layer));
+  nodeSel.append("text").attr("dx", 12).attr("dy", 4)
+    .text(n => truncate(n.label || n.id, 32));
+  nodeSel.append("title").text(n => `${n.label}\n(${n.id})\n${n.description || ""}`);
+}
+
+function curve(a, b) {
+  if (!a || !b) return "";
+  const mx = (a._x + b._x) / 2;
+  return `M${a._x},${a._y} C${mx},${a._y} ${mx},${b._y} ${b._x},${b._y}`;
+}
+
+function layerColor(layer) {
+  const l = Math.min(layer || 0, 3);
+  return `var(--layer${l})`;
+}
+
+function truncate(s, n) {
+  s = String(s || "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// =================================================================
+// Drawer
+// =================================================================
+
+function renderOverviewDrawer() {
+  if (!currentResult) {
+    DrawerEl.innerHTML = '<div class="sub">no result yet</div>';
+    return;
+  }
+  delete DrawerEl.dataset.locked;
+  const r = currentResult;
+  const nNodes = Object.keys(r.graph?.nodes || {}).length;
+  const nEdges = (r.graph?.edges || []).length;
+  const nKept = r.case_studies.filter(cs => cs.similarity_score >= 0.3).length;
+  const nDropped = Object.values(r.debates || {}).filter(d => !d.survives).length;
+  const portfolio = (r.portfolio_impacts || []).map(p => `
+    <div class="row">
+      <span class="k">${p.asset_class}</span>
+      <span class="v ${p.direction === 'up' ? 'pos' : (p.direction === 'down' ? 'neg' : '')}">${p.direction} (${p.magnitude_label})</span>
+    </div>
+  `).join("");
+
+  const scenarios = (r.tail_scenarios || []).map(s => `
+    <div class="quote">
+      <div class="who">${escapeHtml(s.policy_axis || "scenario")} · p=${(s.probability || 0).toFixed(2)} · ${escapeHtml(s.probability_source || "?")}${s.kalshi_market_ticker ? ' · ' + escapeHtml(s.kalshi_market_ticker) : ''}</div>
+      ${escapeHtml(s.text)}
+    </div>
+  `).join("");
+
+  DrawerEl.innerHTML = `
+    <h2>${escapeHtml(r.case_studies[0]?.triggering_event || "Pipeline result")}</h2>
+    <div class="sub">run ${r.run_id}</div>
+    <div class="row"><span class="k">final nodes</span><span class="v">${nNodes}</span></div>
+    <div class="row"><span class="k">final edges</span><span class="v">${nEdges}</span></div>
+    <div class="row"><span class="k">case studies</span><span class="v">${r.case_studies.length} (${nKept} kept)</span></div>
+    <div class="row"><span class="k">edges dropped by debate</span><span class="v neg">${nDropped}</span></div>
+    <div class="row"><span class="k">tail scenarios</span><span class="v">${(r.tail_scenarios || []).length}</span></div>
+    <h3 style="margin-top: 16px;">portfolio impact</h3>
+    ${portfolio || '<div class="sub">no portfolio impacts</div>'}
+    <h3 style="margin-top: 16px;">case studies</h3>
+    ${r.case_studies.map(cs => `
+      <div class="row">
+        <span class="k">${escapeHtml(cs.name)}</span>
+        <span class="v ${cs.similarity_score >= 0.3 ? 'pos' : 'neg'}">sim ${cs.similarity_score.toFixed(2)}</span>
+      </div>
+    `).join("")}
+    ${scenarios ? `<h3 style="margin-top: 16px;">tail scenarios (stage 10)</h3>${scenarios}` : ''}
+  `;
+}
+
+function renderNodeDrawer(node, state) {
+  DrawerEl.dataset.locked = "1";
+  const layer = node.layer ?? 0;
+  const ac = node.asset_class || "(none)";
+  DrawerEl.innerHTML = `
+    <h2>${escapeHtml(node.label || node.id)}</h2>
+    <div class="sub">${escapeHtml(node.id)} · layer ${layer} · ${ac}</div>
+    <div class="row"><span class="k">description</span></div>
+    <div class="quote">${escapeHtml(node.description || "(no description)")}</div>
+    ${node.magnitude_estimate !== null && node.magnitude_estimate !== undefined ? `
+      <div class="row"><span class="k">magnitude</span><span class="v">${node.magnitude_estimate}</span></div>
+    ` : ''}
+    ${(node.evidence && node.evidence.length) ? `
+      <h3 style="margin-top: 12px;">evidence</h3>
+      ${node.evidence.map(ev => `
+        <div class="row">
+          <span class="k">${escapeHtml(ev.kind)}</span>
+          <span class="v">${escapeHtml(ev.ref)}${ev.note ? ' · ' + escapeHtml(ev.note) : ''}</span>
+        </div>
+      `).join("")}
+    ` : ''}
+    <div style="margin-top: 12px;"><button onclick="renderOverviewDrawer()">← back to overview</button></div>
+  `;
+}
+
+function renderEdgeDrawer(edge, graph, state) {
+  DrawerEl.dataset.locked = "1";
+  const src = graph.nodes[edge.src];
+  const dst = graph.nodes[edge.dst];
+  const debate = currentResult?.debates?.[edge.id] || state.result?.debates?.[edge.id];
+  const isFirst = edge.src === graph.root;
+  const droppedBadge = debate && debate.survives === false ? '<span class="badge dropped">dropped</span>' : '';
+
+  let debateBlock = '';
+  if (debate) {
+    const v = debate.verdict;
+    const c = debate.critique || {};
+    const r = debate.rebuttal || {};
+    debateBlock = `
+      <h3 style="margin-top: 14px;">debate</h3>
+      ${v ? `
+        <div class="row"><span class="k">moderator decision</span>
+          <span class="v ${v.decision === 'keep' ? 'pos' : 'neg'}">${v.decision} (adj ${v.confidence_adjustment >= 0 ? '+' : ''}${(v.confidence_adjustment || 0).toFixed(2)})</span></div>
+        <div class="row"><span class="k">defender addresses attack</span>
+          <span class="v ${v.defender_addresses_directly ? 'pos' : 'neg'}">${v.defender_addresses_directly ? 'yes' : 'talks past'}</span></div>
+        <div class="row"><span class="k">evidence winner</span>
+          <span class="v">${escapeHtml(v.evidence_winner || 'tie')}</span></div>
+        ${v.adversary_strongest_point ? `<div class="quote"><div class="who">adversary's strongest claim (restated)</div>${escapeHtml(v.adversary_strongest_point)}</div>` : ''}
+        ${v.defender_strongest_response ? `<div class="quote"><div class="who">defender's strongest response (restated)</div>${escapeHtml(v.defender_strongest_response)}</div>` : ''}
+        <div class="quote"><div class="who">moderator reasoning</div>${escapeHtml(v.reasoning || '')}</div>
+      ` : ''}
+      <div class="quote">
+        <div class="who">adversary · ${escapeHtml(c.attack_type || 'no type')} · score ${(c.score || 0).toFixed(2)}</div>
+        ${escapeHtml(c.counterargument || '')}
+        ${(c.cited_evidence && c.cited_evidence.length) ? `<br><small style="color: var(--muted);">cited: ${escapeHtml(c.cited_evidence.join(', '))}</small>` : ''}
+      </div>
+      <div class="quote">
+        <div class="who">defender · ${escapeHtml(r.defense_type || 'no type')} · score ${(r.score || 0).toFixed(2)}</div>
+        ${escapeHtml(r.rebuttal || '')}
+        ${(r.cited_evidence && r.cited_evidence.length) ? `<br><small style="color: var(--muted);">cited: ${escapeHtml(r.cited_evidence.join(', '))}</small>` : ''}
+      </div>
+    `;
+  }
+
+  DrawerEl.innerHTML = `
+    <h2>${escapeHtml(src?.label || edge.src)} → ${escapeHtml(dst?.label || edge.dst)}
+      ${isFirst ? '<span class="badge first">first link</span>' : ''}
+      ${droppedBadge}
+    </h2>
+    <div class="sub">edge id: ${escapeHtml(edge.id)}</div>
+    <div class="row"><span class="k">mechanism</span></div>
+    <div class="quote">${escapeHtml(edge.mechanism || '')}</div>
+    <div class="row"><span class="k">sensitivity</span><span class="v">${(edge.sensitivity || 0).toFixed(2)}</span></div>
+    <div class="row"><span class="k">confidence</span><span class="v">${(edge.confidence || 0).toFixed(2)}</span></div>
+    ${(edge.supporting_data && edge.supporting_data.length) ? `
+      <h3 style="margin-top: 12px;">supporting data</h3>
+      ${edge.supporting_data.map(ev => `
+        <div class="row">
+          <span class="k">${escapeHtml(ev.kind)}</span>
+          <span class="v">${escapeHtml(ev.ref)}${ev.note ? ' · ' + escapeHtml(ev.note) : ''}</span>
+        </div>
+      `).join("")}
+    ` : '<div class="sub" style="margin-top: 8px;">no supporting data cited</div>'}
+    ${debateBlock}
+    <div style="margin-top: 12px;"><button onclick="renderOverviewDrawer()">← back to overview</button></div>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[ch]));
+}
+
+RunBtn.addEventListener("click", startRun);
+loadRuns();
+</script>
+</body>
+</html>

@@ -9,6 +9,7 @@ You are not picking direction in a vacuum. You are reading what the upstream cau
 - `terminals_by_class`: a dict from `asset_class` to a list of terminal Node objects. Asset class values: `equities`, `futures`, `commodities`, `fx`, `rates`, `macro`, `unclassified`. Each Node has `id`, `label`, `description`, `magnitude_estimate` (signed, optional), `evidence` (citation refs).
 - `edge_stats_by_node`: optional dict mapping node id to `{"avg_confidence": float, "avg_sensitivity": float, "n_inbound": int}`, aggregated from inbound edges. May be empty when the orchestrator did not pass a graph.
 - `seed_event`: the original policy event in plain English, for context.
+- `portfolio_context`: optional plain-English description of the user's current holdings or focus (e.g. "Long NVDA, SOXX, ASML. Short DXY. 60/40 equity/bond with EM tilt."). When present, prefer tickers and instruments that match the user's stated holdings, and surface offsets that hedge their stated positions. The user's portfolio is **not a prescription** to recommend their holdings; it is a hint to make tickers more relevant. If a portfolio terminal pulls against a stated holding, name the offset explicitly.
 
 ## Output
 Call the `submit_portfolio_impacts` tool with one item per asset class that has at least one contributing terminal. Each item:
