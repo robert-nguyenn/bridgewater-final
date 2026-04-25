@@ -61,7 +61,6 @@ dmypy.json
 .claude/
 
 # Project artifacts
-logs/
 .cache/
 cache/
 *.log

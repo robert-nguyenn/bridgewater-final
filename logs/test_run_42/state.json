@@ -1,0 +1,1 @@
+{"run_id": "test_run_42", "status": {"state": "done", "error": null}, "events": [{"kind": "stage_start", "message": "go", "ts": "2026-01-01"}], "current_stage": "done", "trunk": null, "subtrees": {}, "merged_graph": null, "pruned_graph": null, "result": {"run_id": "test_run_42"}, "request": {"event": "test"}, "saved_at": "2026-04-25T03:47:11"}
