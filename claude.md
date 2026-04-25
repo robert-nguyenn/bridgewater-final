@@ -142,6 +142,28 @@ Each agent is a function that takes structured input and returns structured outp
 
 Keep each agent under ~150 lines. If it's getting bigger, split.
 
+## Implementation status
+
+Snapshot at last update; check `src/agents/` for source of truth. The pipeline is partially wired in `src/orchestrator.py`.
+
+| Agent | State | Entry point |
+|-------|-------|-------------|
+| `IdeaAgent` | stub | `src/agents/idea.py` |
+| `AnalogSearchAgent` | shipped | `analog_search.run(node, *, tools, client=None, k=4)` |
+| `TreeBuilderAgent` | shipped | `tree_builder.build_subtree(case_study, *, tools)` (the `run` shim raises) |
+| `SensitivityAgent` | shipped | `sensitivity.score_edge(parent, candidate, mechanism, case_study, *, tools)` |
+| `LogicVerifierAgent` | shipped | `logic_verifier.run(...)` |
+| `AdversaryAgent` | shipped | `adversary.run(target, *, nodes=None, client=None)` |
+| `DefenderAgent` | shipped | `defender.run(target, critique, *, nodes=None, client=None)` |
+| `MacroComparatorAgent` | stub | `src/agents/macro_comparator.py` |
+| `PrunerAgent` | stub | `src/agents/pruner.py` |
+| `PortfolioAgent` | stub | `src/agents/portfolio.py` |
+| `ScenarioAgent` (stretch) | stub | `src/agents/scenario.py` |
+
+**Tools.** FRED is live with disk caching (`fred_get_series`, `fred_find_extrema`, `macro_snapshot`). Yahoo and HF wrappers are stubs.
+
+**Orchestrator.** Stage 5 (adversarial debate) is wired via `run_adversarial_debate(graph, *, model, client)` which returns `dict[target_id, Debate]` for the pruner to consume. Stages 1, 2, 3, 4, 6, 7, 8, 9, 10 are TODO comments awaiting upstream inputs.
+
 ## Tools (function calls Claude makes)
 
 These are the surfaces agents call. Implement once in `src/tools/`, reuse everywhere.
@@ -156,6 +178,8 @@ These are the surfaces agents call. Implement once in `src/tools/`, reuse everyw
 - `macro_snapshot(date) -> MacroSnapshot` — pulls a fixed bundle of FRED series at a date
 
 Every tool returns a typed result and logs the call. Cache aggressively, we will hit the same FRED series many times.
+
+`ToolBundle` slots hold the tool *modules* themselves, not instances. Production code wires them via `src/tools/__init__.py:make_default_tools()`. Agents call functions through the bundle: `tools.fred.fred_find_extrema(...)`, `tools.yahoo.yahoo_prices(...)`. Tests pass duck-typed stubs (any object with the same attribute names) into `ToolBundle(fred=..., yahoo=..., hf=...)`.
 
 ## Sensitivity and confidence: how to score
 
@@ -247,19 +271,32 @@ Before anyone writes an agent, the integrator nails down `src/types.py` and merg
 
 ### How agents stay composable
 
-Every agent is a pure(ish) function with this shape:
+Every agent is a pure(ish) function with this shape (Adversary, Defender, AnalogSearch follow it; new agents should match):
 
 ```python
-def run(input: TypedInput, *, tools: ToolBundle, model: str) -> TypedOutput:
-    ...
+def run(
+    target: TypedInput,
+    *,
+    nodes: dict[str, Node] | None = None,    # graph context if needed
+    tools: ToolBundle | None = None,         # injected, never imported globally
+    model: str = MODEL,                      # MODEL_FAST for sub-calls
+    client: Any = None,                      # Anthropic client; tests inject mock
+    run_id: str | None = None,               # logs key
+) -> TypedOutput: ...
 ```
 
 - No global state.
 - No side effects beyond logging and tool calls.
-- Tools are passed in, never imported at module top. This makes mocking trivial in tests.
+- Tools and the Anthropic client are passed in. Lazy-import `anthropic` inside the function so tests can run without the SDK on the import path.
 - Inputs and outputs are dataclasses from `src/types.py`. If you find yourself returning a dict, stop and add a type.
+- Load the system prompt at runtime: `(PROMPTS_DIR / "<agent>.md").read_text()`.
+- Parse JSON from model output via `from src.agents._common import extract_json`. Clamp 0 to 1 scores via `clamp_score`. Format Node/Edge for prompts via `format_target` / `format_node` / `format_edge`.
+- Log every model call: append `{"stage": ..., "raw": ..., "parsed": ...}` to `LOGS_DIR / run_id / "<agent>" / "calls.jsonl"`. Skip if `run_id` is None.
+- On any tool error or unparseable response: log it, return a typed empty result (empty list, score=0 with note, etc.). Never raise from `run`.
 
 If two agents need to share state, that state lives in the orchestrator, not in either agent.
+
+`TreeBuilder` predates this pattern. It uses a local `_call_model` that tests monkeypatch and a primary entry `build_subtree(case_study, ...)` instead of `run`. New agents should use the `client=` injection above instead.
 
 ### Smoke test contract per module
 
@@ -276,7 +313,7 @@ If the orchestrator can't wire two agents together (output of A doesn't fit inpu
 - **Cache FRED responses to disk** keyed by (series_id, start, end). FRED is fast but we'll re run the pipeline a lot.
 - **Every agent call is logged** to `logs/{run_id}/` with input, output, and prompt hash. Critical for the demo, mentors will ask "why this node".
 - **Prompts live in `prompts/` as markdown.** Load them at runtime. Do not inline long prompts in Python.
-- **Keep the model in one place.** `config.py` holds `MODEL = "claude-opus-4-5-20251101"` (or whichever Opus 4.7 string is current per the API console). Sonnet for cheap subtasks, Opus for the heavy reasoning agents (LogicVerifier, Adversary, MacroComparator).
+- **Keep the model in one place.** `config.py` holds `MODEL = "claude-opus-4-7"` and `MODEL_FAST = "claude-sonnet-4-6"`. MODEL_FAST for cheap sub-calls (proposing children, labeling episodes, picking series). MODEL for the heavy reasoning agents (LogicVerifier, Adversary, MacroComparator) and for sensitivity scoring.
 - **No em dashes, en dashes, or hyphens used as dashes in any user facing prose.** Use commas or periods. Compound hyphens in code identifiers are fine.
 - **DAG only.** Reject cycles at insertion time. `networkx.is_directed_acyclic_graph` after every merge.
 
@@ -395,3 +432,4 @@ python -m src.orchestrator --event "25% tariff on Chinese semiconductors" --dry-
 - Keep diffs small. We'll be reviewing at speed.
 - Run `pytest tests/test_<your_module>.py -x` before declaring anything done. Run the full suite only if you're the integrator merging.
 - Read `prompts/<your_agent>.md` before editing the agent. The prompt is the spec, the Python is the wiring.
+- **Use shared helpers from `src/agents/_common.py`.** `extract_json` parses fenced JSON from model output. `clamp_score` keeps 0 to 1 scores in range. `format_target` / `format_node` / `format_edge` render Nodes and Edges for prompt context. Do not reinvent these per agent.
