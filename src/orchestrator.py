@@ -9,6 +9,7 @@ from src.agents import adversary, defender
 from src.agents.adversary import Critique
 from src.agents.defender import Rebuttal
 from src.config import MODEL
+from src.tools import make_default_tools
 from src.types import CausalGraph, ToolBundle
 
 
@@ -67,7 +68,7 @@ def run_adversarial_debate(
 
 def run_pipeline(event: str, *, dry_run: bool = False, model: str = MODEL) -> CausalGraph:
     """Stage 1 to 10. See CLAUDE.md 'Pipeline (end to end)'."""
-    tools = ToolBundle()  # noqa: F841 — wired into stages once they're real
+    tools: ToolBundle = make_default_tools()
     graph = CausalGraph()
 
     # TODO(integration): stage 1 IdeaAgent -> first-order Nodes
