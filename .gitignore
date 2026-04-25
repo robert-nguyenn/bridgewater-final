@@ -57,6 +57,9 @@ dmypy.json
 .env.*
 !.env.example
 
+# Claude Code local settings (per-user)
+.claude/
+
 # Project artifacts
 logs/
 .cache/
