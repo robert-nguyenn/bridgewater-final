@@ -1,140 +1,57 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from src.agents._common import extract_json
 from src.config import ANTHROPIC_API_KEY, MODEL, PROMPTS_DIR
-from src.types import Edge, Node, ToolBundle
+from src.types import CausalGraph, Edge, Node, ToolBundle
 
-FAILURE_CATEGORIES = {
-    # Chain-validity failures
-    "hidden_assumption",
-    "mechanism_mismatch",
-    "magnitude_leap",
-    "equivocation",
-    "time_mismatch",
-    "missing_step",
-    "sign_inconsistency",
-    "score_evidence_mismatch",
-    # Common LLM reasoning failures the verifier explicitly catches
-    "reverse_causation",        # X→Y claimed when actual direction is Y→X
-    "spurious_correlation",     # cites co-movement without a named mechanism
-    "selection_bias",           # cites only confirming episodes, ignores misses
-    "base_rate_neglect",        # extrapolates from one episode, ignores priors
-    "fabricated_evidence",      # cites series/tickers/episodes that don't exist
-    "levels_confusion",         # micro effect inflated to macro (or vice versa)
-    "affirming_consequent",     # from "A→B" and "B observed", claims "A"
+logger = logging.getLogger(__name__)
+
+# Chain-level failure categories. The per-edge Moderator catches single-edge
+# issues (mechanism mismatch, hidden assumption, etc.); this verifier catches
+# coherence failures that span multiple edges.
+CHAIN_FAILURE_CATEGORIES = {
+    "sign_inconsistency",   # +/-/+/- across chain doesn't compose
+    "magnitude_leap",        # small cause -> large effect without an amplifier
+    "equivocation",          # same term means different things across steps
+    "time_mismatch",         # short-horizon step feeds long-horizon with no buffer
+    "missing_step",          # obvious intermediate variable skipped
 }
 
 
 @dataclass
-class StepAnalysis:
-    edge_idx: int
-    src_label: str
-    dst_label: str
-    mechanism: str
-    preconditions: list[str] = field(default_factory=list)
-    sign: str = "unclear"
-    magnitude_class: str = "unclear"
-    horizon: str = "unclear"
-    local_ok: bool = True
-    local_reason: str = ""
-
-
-@dataclass
-class ConsistencyIssue:
-    edge_idx: int
-    field: str  # "confidence" | "sensitivity"
-    score: float
-    evidence_count: int
-    expected: str
-    severity: str  # "fail" | "warning"
-
-
-@dataclass
-class VerificationResult:
+class ChainVerification:
     ok: bool
     reason: str
     failed_edge_idx: Optional[int] = None
     failure_category: Optional[str] = None
-    step_analyses: list[StepAnalysis] = field(default_factory=list)
-    consistency_issues: list[ConsistencyIssue] = field(default_factory=list)
     raw_response: Optional[str] = None
 
 
-def check_score_evidence_consistency(chain: list[Edge]) -> list[ConsistencyIssue]:
-    """Structural check: each edge's scores must be backed by enough cited evidence.
-
-    Hard rule (CLAUDE.md): any score above 0.3 requires a citation. Soft rules
-    (rubric): 0.6+ expects 2+ episodes, 0.85+ expects 3+, sensitivity 0.8+
-    expects 2+. Hard rule produces severity 'fail', rubric produces 'warning'.
-    """
-    issues: list[ConsistencyIssue] = []
-    for i, edge in enumerate(chain):
-        n = len(edge.supporting_data)
-
-        # Hard rule: score above 0.3 needs a citation.
-        if edge.confidence > 0.3 and n == 0:
-            issues.append(ConsistencyIssue(
-                edge_idx=i,
-                field="confidence",
-                score=edge.confidence,
-                evidence_count=n,
-                expected="confidence > 0.3 requires at least 1 cited source",
-                severity="fail",
-            ))
-        if edge.sensitivity > 0.3 and n == 0:
-            issues.append(ConsistencyIssue(
-                edge_idx=i,
-                field="sensitivity",
-                score=edge.sensitivity,
-                evidence_count=n,
-                expected="sensitivity > 0.3 requires at least 1 cited source",
-                severity="fail",
-            ))
-
-        # Rubric warnings.
-        if edge.confidence > 0.6 and n < 2:
-            issues.append(ConsistencyIssue(
-                edge_idx=i,
-                field="confidence",
-                score=edge.confidence,
-                evidence_count=n,
-                expected="confidence > 0.6 expects 2+ cited episodes per rubric",
-                severity="warning",
-            ))
-        if edge.confidence > 0.85 and n < 3:
-            issues.append(ConsistencyIssue(
-                edge_idx=i,
-                field="confidence",
-                score=edge.confidence,
-                evidence_count=n,
-                expected="confidence > 0.85 expects 3+ cited episodes per rubric",
-                severity="warning",
-            ))
-        if edge.sensitivity > 0.8 and n < 2:
-            issues.append(ConsistencyIssue(
-                edge_idx=i,
-                field="sensitivity",
-                score=edge.sensitivity,
-                evidence_count=n,
-                expected="sensitivity > 0.8 expects multiple episodes per rubric",
-                severity="warning",
-            ))
-    return issues
+# Bridge edges connect today's first-order nodes to case-study subtree roots
+# (mechanism starts with "historical analog: ..."). Their semantics are
+# "this past episode informs this present-day variable" — NOT a forward
+# causal link. Chain verification must not treat them as causal steps,
+# otherwise it flags them as time_mismatch / reverse causation.
+_BRIDGE_PREFIX = "historical analog:"
 
 
-def _format_chain(chain: list[Edge], nodes: dict[str, Node]) -> str:
+def _is_bridge_edge(edge: Edge) -> bool:
+    return bool(edge.mechanism) and edge.mechanism.startswith(_BRIDGE_PREFIX)
+
+
+def _format_chain(edges: list[Edge], nodes: dict[str, Node]) -> str:
     lines: list[str] = ["Causal chain to verify, ordered left to right.", ""]
-    for i, e in enumerate(chain):
+    for i, e in enumerate(edges):
         src = nodes.get(e.src)
         dst = nodes.get(e.dst)
         src_label = src.label if src else e.src
         dst_label = dst.label if dst else e.dst
         lines.append(f"Step {i}: [{e.src}] {src_label}  ->  [{e.dst}] {dst_label}")
-        if src and src.description:
-            lines.append(f"  source description: {src.description}")
         if dst and dst.description:
             lines.append(f"  destination description: {dst.description}")
         lines.append(f"  named mechanism: {e.mechanism}")
@@ -146,88 +63,46 @@ def _format_chain(chain: list[Edge], nodes: dict[str, Node]) -> str:
     return "\n".join(lines)
 
 
-def _coerce_step(raw: dict[str, Any]) -> StepAnalysis:
-    return StepAnalysis(
-        edge_idx=int(raw.get("edge_idx", -1)),
-        src_label=str(raw.get("src_label", "")),
-        dst_label=str(raw.get("dst_label", "")),
-        mechanism=str(raw.get("mechanism", "")),
-        preconditions=[str(p) for p in raw.get("preconditions", [])],
-        sign=str(raw.get("sign", "unclear")),
-        magnitude_class=str(raw.get("magnitude_class", "unclear")),
-        horizon=str(raw.get("horizon", "unclear")),
-        local_ok=bool(raw.get("local_ok", True)),
-        local_reason=str(raw.get("local_reason", "")),
-    )
-
-
-def _parse_response(text: str) -> VerificationResult:
+def _parse(text: str) -> ChainVerification:
     parsed = extract_json(text)
     if parsed is None:
-        return VerificationResult(
-            ok=False,
-            reason="could not parse verifier response as JSON",
-            raw_response=text,
-        )
-
-    steps = [_coerce_step(s) for s in parsed.get("step_analyses", [])]
-
-    category = parsed.get("failure_category")
-    if category is not None and category not in FAILURE_CATEGORIES:
-        category = None
-
+        return ChainVerification(ok=False, reason="parse failed", raw_response=text)
+    cat = parsed.get("failure_category")
+    if cat is not None and cat not in CHAIN_FAILURE_CATEGORIES:
+        cat = None
     failed_idx = parsed.get("failed_edge_idx")
     if failed_idx is not None:
         try:
             failed_idx = int(failed_idx)
         except (TypeError, ValueError):
             failed_idx = None
-
-    return VerificationResult(
+    return ChainVerification(
         ok=bool(parsed.get("ok", False)),
         reason=str(parsed.get("reason", "")),
         failed_edge_idx=failed_idx,
-        failure_category=category,
-        step_analyses=steps,
+        failure_category=cat,
         raw_response=text,
     )
-
-
-def _merge_consistency(result: VerificationResult, issues: list[ConsistencyIssue]) -> VerificationResult:
-    """Attach issues; if any are 'fail' and the LLM verdict was ok, override to fail."""
-    result.consistency_issues = issues
-    fails = [c for c in issues if c.severity == "fail"]
-    if fails and result.ok:
-        first = fails[0]
-        result.ok = False
-        result.failure_category = "score_evidence_mismatch"
-        result.failed_edge_idx = first.edge_idx
-        result.reason = (
-            f"score-evidence mismatch on edge {first.edge_idx}: "
-            f"{first.expected} (got {first.evidence_count})"
-        )
-    return result
 
 
 def run(
     chain: list[Edge],
     *,
     nodes: dict[str, Node],
-    tools: Optional[ToolBundle] = None,
     model: str = MODEL,
     client: Any = None,
-) -> VerificationResult:
-    """Lean-style local validity check on a causal chain plus a structural
-    score-vs-evidence consistency check.
+    tools: Optional[ToolBundle] = None,
+    run_id: Optional[str] = None,
+) -> ChainVerification:
+    """Verify a multi-edge chain for cross-step coherence.
 
-    `nodes` maps node id to Node so the verifier sees labels and descriptions
-    rather than just edge endpoint ids. `client` is an injected anthropic
-    client for testability; if None, one is constructed from env.
+    Single-edge "chains" pass trivially since chain-level checks need >= 2
+    edges to fire. The per-edge Moderator already covers single-edge logic.
     """
     if not chain:
-        return VerificationResult(ok=True, reason="empty chain")
-
-    issues = check_score_evidence_consistency(chain)
+        return ChainVerification(ok=True, reason="empty chain")
+    if len(chain) < 2:
+        return ChainVerification(ok=True, reason="single-edge chain (no chain-level checks)")
 
     system_prompt = (PROMPTS_DIR / "logic_verifier.md").read_text()
     user_text = _format_chain(chain, nodes)
@@ -239,11 +114,104 @@ def run(
 
     msg = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=2048,
         system=system_prompt,
         messages=[{"role": "user", "content": user_text}],
     )
-
     text = msg.content[0].text if msg.content else ""
-    result = _parse_response(text)
-    return _merge_consistency(result, issues)
+    return _parse(text)
+
+
+def verify_paths(
+    graph: CausalGraph,
+    *,
+    model: str = MODEL,
+    client: Any = None,
+    run_id: Optional[str] = None,
+    max_paths: int = 20,
+    min_path_length: int = 2,
+    cutoff: int = 8,
+    max_workers: int = 4,
+) -> dict[str, ChainVerification]:
+    """Walk root-to-leaf paths in the graph and verify each one in parallel.
+
+    Returns a dict keyed by ``"->".join(edge_ids)``. Paths shorter than
+    `min_path_length` (in edges) are skipped (covered by per-edge moderator).
+    Total work is capped at `max_paths`, prioritizing the longest paths.
+    """
+    import networkx as nx
+
+    if not graph.root or graph.root not in graph.nodes:
+        return {}
+
+    g = nx.DiGraph()
+    for nid in graph.nodes:
+        g.add_node(nid)
+    edges_by_pair: dict[tuple[str, str], Edge] = {}
+    for e in graph.edges:
+        g.add_edge(e.src, e.dst)
+        edges_by_pair[(e.src, e.dst)] = e
+
+    leaves = [n for n in g.nodes if g.out_degree(n) == 0 and n != graph.root]
+    raw_paths: list[list[str]] = []
+    for leaf in leaves:
+        try:
+            for path in nx.all_simple_paths(g, source=graph.root, target=leaf, cutoff=cutoff):
+                if len(path) - 1 >= min_path_length:
+                    raw_paths.append(path)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+    raw_paths.sort(key=lambda p: -len(p))
+    raw_paths = raw_paths[:max_paths]
+
+    # Walk every path and split at bridge edges (historical-analog links).
+    # Today-side and historical-side segments get verified independently so
+    # the verifier never grades a chain that crosses time/causality regimes.
+    chains: list[tuple[str, list[Edge]]] = []
+    seen_keys: set[str] = set()
+    for path in raw_paths:
+        edges_in_path: list[Edge] = []
+        ok = True
+        for i in range(len(path) - 1):
+            edge = edges_by_pair.get((path[i], path[i + 1]))
+            if edge is None:
+                ok = False
+                break
+            edges_in_path.append(edge)
+        if not ok:
+            continue
+
+        current_segment: list[Edge] = []
+        for e in edges_in_path:
+            if _is_bridge_edge(e):
+                if len(current_segment) >= min_path_length:
+                    key = "->".join(seg_e.id for seg_e in current_segment)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        chains.append((key, list(current_segment)))
+                current_segment = []
+            else:
+                current_segment.append(e)
+        if len(current_segment) >= min_path_length:
+            key = "->".join(seg_e.id for seg_e in current_segment)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                chains.append((key, list(current_segment)))
+
+    results: dict[str, ChainVerification] = {}
+    if not chains:
+        return results
+
+    def _verify(item):
+        key, edges = item
+        return key, run(edges, nodes=graph.nodes, model=model, client=client, run_id=run_id)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for fut in as_completed([executor.submit(_verify, c) for c in chains]):
+            try:
+                key, result = fut.result()
+                results[key] = result
+            except Exception as exc:
+                logger.warning("chain verification failed: %s", exc)
+    return results

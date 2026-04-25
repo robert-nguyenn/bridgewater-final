@@ -37,10 +37,22 @@
   header .title { font-weight: 600; letter-spacing: 0.5px; }
   header .title span { color: var(--accent); }
   header .meta { color: var(--muted); font-size: 11px; }
-  main { display: grid; grid-template-columns: 360px 1fr 380px; height: calc(100vh - 50px); }
+  main { display: grid; grid-template-columns: 360px 1fr 380px; height: calc(100vh - 50px); transition: grid-template-columns 0.2s ease; }
+  main.right-collapsed { grid-template-columns: 360px 1fr 0; }
+  main.right-collapsed .right { display: none; }
   .left, .right { border-right: 1px solid var(--border); overflow-y: auto; background: var(--panel); }
   .right { border-right: none; border-left: 1px solid var(--border); }
   .center { position: relative; overflow: hidden; background: var(--bg); }
+  .center.grid-view { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); grid-auto-rows: minmax(220px, 1fr); gap: 6px; padding: 36px 6px 6px 6px; overflow: auto; align-content: start; }
+  .center.grid-view #graph { display: none; }
+  .subtree-cell { position: relative; border: 1px solid var(--border); background: var(--bg-2); border-radius: 3px; overflow: hidden; }
+  .subtree-cell .cell-label { position: absolute; top: 3px; left: 3px; background: var(--bg); padding: 2px 6px; font-size: 9px; color: var(--accent); border-radius: 2px; z-index: 5; max-width: 80%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtree-cell .cell-status { position: absolute; top: 3px; right: 3px; background: var(--bg); padding: 1px 5px; font-size: 9px; border-radius: 2px; z-index: 5; }
+  .subtree-cell .cell-status.live { color: var(--accent); }
+  .subtree-cell .cell-status.complete { color: var(--pos); }
+  .subtree-cell svg { width: 100%; height: 100%; display: block; }
+  .header-btn { background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 4px 10px; font-family: inherit; font-size: 10px; cursor: pointer; border-radius: 2px; letter-spacing: 0.5px; }
+  .header-btn:hover { color: var(--accent); border-color: var(--accent); }
 
   .pane { padding: 14px 16px; border-bottom: 1px solid var(--border); }
   .pane h3 { margin: 0 0 8px 0; font-size: 11px; letter-spacing: 1px;
@@ -94,6 +106,7 @@
 
   .link { fill: none; cursor: pointer; }
   .link.first { stroke-dasharray: 6 4; }
+  .link.bridge { stroke: var(--first); stroke-dasharray: 3 3; opacity: 0.7; }
   .link:hover { stroke-width: 5 !important; }
 
   .drawer { padding: 14px 16px; }
@@ -117,18 +130,19 @@
                 text-transform: uppercase; letter-spacing: 0.5px; }
 
   .stage-tag {
-    display: inline-block; background: var(--bg-2); border: 1px solid var(--border);
-    color: var(--accent); padding: 2px 8px; font-size: 10px; border-radius: 2px;
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--bg-2); border: 1px solid var(--border);
+    color: var(--accent); padding: 4px 10px; font-size: 10px; border-radius: 2px;
     margin-bottom: 6px; letter-spacing: 0.5px;
   }
-
-  .loading { position: absolute; inset: 0; background: rgba(11,13,16,0.78);
-             display: flex; align-items: center; justify-content: center;
-             flex-direction: column; gap: 10px; z-index: 10;
-             color: var(--accent); font-size: 12px; }
-  .spinner { width: 24px; height: 24px; border: 2px solid var(--border);
-             border-top-color: var(--accent); border-radius: 50%;
-             animation: spin 0.9s linear infinite; }
+  .stage-tag .spinner-inline {
+    width: 11px; height: 11px; border: 1.5px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+    display: none; flex-shrink: 0;
+  }
+  .stage-tag.running .spinner-inline { display: inline-block; }
+  .stage-tag-time { color: var(--muted); font-size: 10px; margin-left: 4px; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
@@ -136,6 +150,12 @@
 <header>
   <div class="title">policy<span> impact mapper</span></div>
   <div class="meta" id="status-meta">idle</div>
+  <div style="margin-left: auto; display: flex; gap: 8px;">
+    <label style="display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); cursor: pointer;">
+      <input type="checkbox" id="toggle-multi" style="margin: 0;" /> Show all subtrees
+    </label>
+    <button class="header-btn" id="toggle-right">◀ details</button>
+  </div>
 </header>
 <main>
   <aside class="left">
@@ -175,13 +195,14 @@
     </div>
   </aside>
 
-  <section class="center">
-    <div id="loading" class="loading" style="display:none;">
-      <div class="spinner"></div>
-      <div id="loading-text">starting...</div>
+  <section class="center" id="center">
+    <div id="stage-tag" class="stage-tag" style="position: absolute; top: 12px; left: 12px; z-index: 5; display: none;">
+      <span class="spinner-inline" id="stage-spinner"></span>
+      <span id="stage-tag-text"></span>
+      <span class="stage-tag-time" id="stage-tag-time"></span>
     </div>
-    <div id="stage-tag" class="stage-tag" style="position: absolute; top: 12px; left: 12px; z-index: 5; display: none;"></div>
     <svg id="graph"></svg>
+    <div id="grid-cells" style="display: none;"></div>
   </section>
 
   <aside class="right">
@@ -202,10 +223,41 @@ const EventsEl = document.getElementById("events");
 const RunsEl = document.getElementById("runs");
 const StatusMetaEl = document.getElementById("status-meta");
 const DrawerEl = document.getElementById("drawer");
-const LoadingEl = document.getElementById("loading");
-const LoadingTextEl = document.getElementById("loading-text");
 const StageTagEl = document.getElementById("stage-tag");
+const StageTagText = document.getElementById("stage-tag-text");
+const StageTagTime = document.getElementById("stage-tag-time");
 const SVG = d3.select("#graph");
+const CenterEl = document.getElementById("center");
+const GridCellsEl = document.getElementById("grid-cells");
+const ToggleMulti = document.getElementById("toggle-multi");
+const ToggleRight = document.getElementById("toggle-right");
+const MainEl = document.querySelector("main");
+
+ToggleRight.addEventListener("click", () => {
+  const collapsed = MainEl.classList.toggle("right-collapsed");
+  ToggleRight.textContent = collapsed ? "▶ details" : "◀ details";
+});
+
+ToggleMulti.addEventListener("change", () => {
+  if (currentRunId) pollOnce();  // re-render in the new mode
+});
+
+function setSpinning(active) {
+  StageTagEl.style.display = "inline-flex";
+  if (active) StageTagEl.classList.add("running");
+  else StageTagEl.classList.remove("running");
+}
+
+function setStageTag(tag) {
+  if (tag) {
+    StageTagEl.style.display = "inline-flex";
+    StageTagText.textContent = tag;
+  }
+}
+
+function setStageTime(secs) {
+  StageTagTime.textContent = (secs == null) ? "" : `${secs}s`;
+}
 
 let currentRunId = null;
 let currentResult = null;
@@ -245,8 +297,9 @@ async function startRun() {
   const event = EventEl.value.trim();
   if (!event) { alert("enter an event"); return; }
   RunBtn.disabled = true;
-  LoadingEl.style.display = "flex";
-  LoadingTextEl.textContent = "queuing...";
+  setSpinning(true);
+  setStageTag("queuing...");
+  setStageTime(null);
   EventsEl.innerHTML = "";
   lastEventCount = 0;
   DrawerEl.innerHTML = '<div class="sub">running...</div>';
@@ -269,7 +322,7 @@ async function startRun() {
   } catch (e) {
     alert("failed to start: " + e.message);
     RunBtn.disabled = false;
-    LoadingEl.style.display = "none";
+    setSpinning(false);
   }
 }
 
@@ -286,16 +339,17 @@ function pollLoop() {
       const data = await fetchJson(`/api/runs/${currentRunId}`);
       ingestState(data);
       const secs = Math.round((Date.now() - t0) / 1000);
-      LoadingTextEl.textContent = (data.current_stage || "starting") + ` · ${secs}s`;
+      setStageTime(secs);
       const state = data.status?.state;
       if (state === "done") {
-        LoadingEl.style.display = "none";
+        setSpinning(false);
         RunBtn.disabled = false;
         loadRuns();
         return;
       }
       if (state === "failed") {
-        LoadingEl.style.display = "none";
+        setSpinning(false);
+        setStageTag("failed");
         RunBtn.disabled = false;
         alert("run failed: " + (data.status.error || "unknown"));
         return;
@@ -332,16 +386,44 @@ function ingestState(data) {
   }
   lastEventCount = events.length;
 
-  // Pick the freshest graph snapshot to render.
+  // Find the most recently updated in-progress subtree, if any.
+  let inProgressSubtree = null;
+  const subtrees = data.subtrees || {};
+  for (const csId of Object.keys(subtrees)) {
+    const info = subtrees[csId];
+    if (!info || info.complete) continue;
+    if (!inProgressSubtree || (info.updated_at || "") > (inProgressSubtree.updated_at || "")) {
+      inProgressSubtree = info;
+    }
+  }
+
+  // Multi-subtree grid mode: render every tracked subtree side by side.
+  if (ToggleMulti.checked && Object.keys(subtrees).length > 0) {
+    setStageTag(`ALL SUBTREES (${Object.keys(subtrees).length})`);
+    renderSubtreeGrid(subtrees, data);
+    if (data.result && data.pruned_graph) {
+      // After completion, also render the merged result alongside.
+    }
+    return;
+  }
+
+  // Single-graph mode. Priority: pruned > merged > in-progress subtree > trunk.
+  CenterEl.classList.remove("grid-view");
+  GridCellsEl.style.display = "none";
+  GridCellsEl.innerHTML = "";
+
   let g = null, tag = null;
   if (data.pruned_graph) { g = data.pruned_graph; tag = "PRUNED"; }
   else if (data.merged_graph) { g = data.merged_graph; tag = "MERGED (pre-prune)"; }
+  else if (inProgressSubtree && inProgressSubtree.graph) {
+    g = inProgressSubtree.graph;
+    tag = `BUILDING: ${inProgressSubtree.name || "subtree"}`;
+  }
   else if (data.trunk) { g = data.trunk; tag = "TRUNK + first-order"; }
 
   if (g) {
-    StageTagEl.style.display = "inline-block";
-    StageTagEl.textContent = tag;
-    renderGraph(g, data);
+    setStageTag(tag);
+    renderGraph(SVG, g, data);
   }
 
   if (data.result) {
@@ -354,9 +436,58 @@ function ingestState(data) {
 // D3 rendering
 // =================================================================
 
-function renderGraph(graph, state) {
-  SVG.selectAll("*").remove();
-  const bbox = SVG.node().getBoundingClientRect();
+function renderSubtreeGrid(subtrees, state) {
+  CenterEl.classList.add("grid-view");
+  GridCellsEl.style.display = "grid";
+  // Sort: in-progress first (by recency), complete last.
+  const entries = Object.entries(subtrees).sort((a, b) => {
+    const ai = a[1].complete ? 1 : 0;
+    const bi = b[1].complete ? 1 : 0;
+    if (ai !== bi) return ai - bi;
+    return (b[1].updated_at || "").localeCompare(a[1].updated_at || "");
+  });
+  // Reuse cells where possible; rebuild if the set of ids changes.
+  const desiredIds = entries.map(([id]) => id).join("|");
+  if (GridCellsEl.dataset.ids !== desiredIds) {
+    GridCellsEl.innerHTML = "";
+    GridCellsEl.dataset.ids = desiredIds;
+    GridCellsEl.style.display = "grid";
+    GridCellsEl.style.gridTemplateColumns = "repeat(auto-fit, minmax(280px, 1fr))";
+    GridCellsEl.style.gridAutoRows = "minmax(220px, 1fr)";
+    GridCellsEl.style.gap = "6px";
+    GridCellsEl.style.padding = "36px 6px 6px 6px";
+    GridCellsEl.style.position = "absolute";
+    GridCellsEl.style.inset = "0";
+    GridCellsEl.style.overflow = "auto";
+    for (const [csId] of entries) {
+      const cell = document.createElement("div");
+      cell.className = "subtree-cell";
+      cell.dataset.csId = csId;
+      cell.innerHTML = `
+        <span class="cell-label"></span>
+        <span class="cell-status"></span>
+        <svg></svg>
+      `;
+      GridCellsEl.appendChild(cell);
+    }
+  }
+  // Update each cell.
+  for (const [csId, info] of entries) {
+    const cell = GridCellsEl.querySelector(`[data-cs-id="${csId}"]`);
+    if (!cell) continue;
+    cell.querySelector(".cell-label").textContent = info.name || csId;
+    const status = cell.querySelector(".cell-status");
+    status.textContent = info.complete ? "✓ done" : "live";
+    status.className = "cell-status " + (info.complete ? "complete" : "live");
+    const svg = d3.select(cell.querySelector("svg"));
+    if (info.graph) renderGraph(svg, info.graph, state, true);
+  }
+}
+
+
+function renderGraph(svgSel, graph, state, mini = false) {
+  svgSel.selectAll("*").remove();
+  const bbox = svgSel.node().getBoundingClientRect();
   const W = bbox.width, H = bbox.height;
   const nodes = Object.values(graph.nodes || {});
   const edges = (graph.edges || []).filter(e => graph.nodes[e.src] && graph.nodes[e.dst]);
@@ -386,9 +517,33 @@ function renderGraph(graph, state) {
   const linkWidth = (e) => 1 + 4 * (e.sensitivity || 0);
   const linkOpacity = (e) => 0.3 + 0.7 * (e.confidence || 0);
 
-  const linkGroup = SVG.append("g").attr("class", "links");
+  // Compute curve offsets so edges between nodes in the same layer don't
+  // overlap. Edges are grouped by (src_layer, dst_layer) and offset within
+  // their group by index.
+  const sameLayerGroups = new Map();
+  for (const e of edges) {
+    const a = idToNode.get(e.src);
+    const b = idToNode.get(e.dst);
+    if (!a || !b) continue;
+    if (a.layer === b.layer) {
+      const key = `${a.layer}-${a._y < b._y ? "fwd" : "rev"}`;
+      if (!sameLayerGroups.has(key)) sameLayerGroups.set(key, []);
+      sameLayerGroups.get(key).push(e.id);
+    }
+  }
+  const edgeOrdinal = new Map();
+  for (const ids of sameLayerGroups.values()) {
+    ids.forEach((id, i) => edgeOrdinal.set(id, i));
+  }
+
+  const linkGroup = svgSel.append("g").attr("class", "links");
   linkGroup.selectAll("path").data(edges).join("path")
-    .attr("class", e => "link" + (e.src === graph.root ? " first" : ""))
+    .attr("class", e => {
+      let cls = "link";
+      if (e.src === graph.root) cls += " first";
+      if (e.mechanism && String(e.mechanism).startsWith("historical analog:")) cls += " bridge";
+      return cls;
+    })
     .attr("stroke", e => {
       const surv = state.result?.debates?.[e.id]?.survives;
       if (surv === false) return "var(--neg)";
@@ -396,29 +551,46 @@ function renderGraph(graph, state) {
     })
     .attr("stroke-width", linkWidth)
     .attr("stroke-opacity", linkOpacity)
-    .attr("d", e => curve(idToNode.get(e.src), idToNode.get(e.dst)))
+    .attr("d", e => curve(idToNode.get(e.src), idToNode.get(e.dst), edgeOrdinal.get(e.id) || 0))
     .on("click", (ev, e) => renderEdgeDrawer(e, graph, state))
     .append("title").text(e => `${idToNode.get(e.src)?.label} -> ${idToNode.get(e.dst)?.label}\nmechanism: ${e.mechanism}\nsensitivity: ${(e.sensitivity || 0).toFixed(2)}\nconfidence: ${(e.confidence || 0).toFixed(2)}`);
 
   // Nodes
-  const nodeGroup = SVG.append("g").attr("class", "nodes");
+  const nodeGroup = svgSel.append("g").attr("class", "nodes");
   const nodeSel = nodeGroup.selectAll("g").data(nodes).join("g")
     .attr("class", n => "node" + (n.id === graph.root ? " is-root" : ""))
     .attr("transform", n => `translate(${n._x},${n._y})`)
     .on("click", (ev, n) => renderNodeDrawer(n, state));
 
   nodeSel.append("circle")
-    .attr("r", n => n.id === graph.root ? 10 : 7)
+    .attr("r", n => n.id === graph.root ? (mini ? 6 : 10) : (mini ? 4 : 7))
     .attr("fill", n => layerColor(n.layer));
-  nodeSel.append("text").attr("dx", 12).attr("dy", 4)
-    .text(n => truncate(n.label || n.id, 32));
+  if (!mini) {
+    nodeSel.append("text").attr("dx", 12).attr("dy", 4)
+      .text(n => truncate(n.label || n.id, 32));
+  }
   nodeSel.append("title").text(n => `${n.label}\n(${n.id})\n${n.description || ""}`);
 }
 
-function curve(a, b) {
+// `ordinal` separates parallel/same-layer edges so they don't overlap.
+function curve(a, b, ordinal = 0) {
   if (!a || !b) return "";
+  const dx = b._x - a._x;
+  const dy = b._y - a._y;
+  const sameLayer = Math.abs(dy) < 5;
+  if (sameLayer) {
+    // Arc above (or below) the layer line. Arc height grows with span and ordinal.
+    const mx = (a._x + b._x) / 2;
+    const arcDir = (ordinal % 2 === 0) ? -1 : 1;
+    const arcDepth = (Math.abs(dx) * 0.3) + (Math.floor(ordinal / 2) * 14);
+    const my = a._y + arcDir * arcDepth;
+    return `M${a._x},${a._y} Q${mx},${my} ${b._x},${b._y}`;
+  }
+  // Cross-layer: curved bezier with horizontal control points; small ordinal
+  // offset on the control points to separate parallel cross-layer edges.
+  const offset = ordinal * 8;
   const mx = (a._x + b._x) / 2;
-  return `M${a._x},${a._y} C${mx},${a._y} ${mx},${b._y} ${b._x},${b._y}`;
+  return `M${a._x},${a._y} C${mx + offset},${a._y} ${mx + offset},${b._y} ${b._x},${b._y}`;
 }
 
 function layerColor(layer) {
@@ -522,12 +694,14 @@ function renderEdgeDrawer(edge, graph, state) {
     debateBlock = `
       <h3 style="margin-top: 14px;">debate</h3>
       ${v ? `
+        ${v.synthesis ? `<div class="quote" style="border-left-color: var(--accent);"><div class="who">synthesis</div><strong>${escapeHtml(v.synthesis)}</strong></div>` : ''}
         <div class="row"><span class="k">moderator decision</span>
           <span class="v ${v.decision === 'keep' ? 'pos' : 'neg'}">${v.decision} (adj ${v.confidence_adjustment >= 0 ? '+' : ''}${(v.confidence_adjustment || 0).toFixed(2)})</span></div>
         <div class="row"><span class="k">defender addresses attack</span>
           <span class="v ${v.defender_addresses_directly ? 'pos' : 'neg'}">${v.defender_addresses_directly ? 'yes' : 'talks past'}</span></div>
         <div class="row"><span class="k">evidence winner</span>
           <span class="v">${escapeHtml(v.evidence_winner || 'tie')}</span></div>
+        ${v.independent_logic_failure ? `<div class="row"><span class="k">logic flag</span><span class="v neg">${escapeHtml(v.independent_logic_failure)}</span></div>` : ''}
         ${v.adversary_strongest_point ? `<div class="quote"><div class="who">adversary's strongest claim (restated)</div>${escapeHtml(v.adversary_strongest_point)}</div>` : ''}
         ${v.defender_strongest_response ? `<div class="quote"><div class="who">defender's strongest response (restated)</div>${escapeHtml(v.defender_strongest_response)}</div>` : ''}
         <div class="quote"><div class="who">moderator reasoning</div>${escapeHtml(v.reasoning || '')}</div>

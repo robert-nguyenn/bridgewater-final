@@ -41,6 +41,7 @@ def test_parse_full_4pass_payload():
   "evidence_winner": "defender",
   "decision": "keep",
   "confidence_adjustment": 0.05,
+  "synthesis": "USD weakens via capital-flow channel, with confidence downgraded for tariff-specific exceptions.",
   "reasoning": "Defender directly countered with a dated episode; defender evidence wins."
 }
 ```"""
@@ -50,6 +51,14 @@ def test_parse_full_4pass_payload():
     assert v.defender_addresses_directly is True
     assert v.evidence_winner == "defender"
     assert v.decision == "keep"
+    assert "capital-flow" in v.synthesis
+
+
+def test_parse_synthesis_optional():
+    """Old JSON without the synthesis field still parses; defaults to empty string."""
+    text = '```json\n{"target_id": "e1", "decision": "keep"}\n```'
+    v = _parse(text, "fb")
+    assert v.synthesis == ""
 
 
 def test_parse_unknown_evidence_winner_defaults_to_tie():

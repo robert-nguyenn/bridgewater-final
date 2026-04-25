@@ -64,7 +64,6 @@ class AnalyzeRequest(BaseModel):
     max_analogs_per_node: int = 4
     similarity_threshold: float = 0.2
     use_moderator: bool = True
-    use_logic_verifier: bool = True
     run_scenarios: bool = True
 
 
@@ -89,11 +88,27 @@ def _on_progress_factory(run_id: str):
             elif ev.kind == "case_study_built" and data.get("subtree"):
                 cs_id = data.get("case_study_id")
                 if cs_id:
-                    state["subtrees"][cs_id] = {
+                    state["subtrees"].setdefault(cs_id, {})
+                    state["subtrees"][cs_id].update({
                         "name": data.get("name"),
                         "first_order_label": data.get("first_order_label"),
                         "graph": _serialize(data["subtree"]),
-                    }
+                        "complete": True,
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    })
+            elif ev.kind in ("subtree_init", "subtree_candidate_added", "subtree_candidate_merged") and data.get("partial_graph"):
+                # Live partial subtree snapshot. Lets the UI render the tree
+                # as it is being built, between case_study_started and case_study_built.
+                cs_id = data.get("case_study_id")
+                if cs_id:
+                    state["subtrees"].setdefault(cs_id, {})
+                    state["subtrees"][cs_id].update({
+                        "name": data.get("name") or state["subtrees"][cs_id].get("name"),
+                        "first_order_label": data.get("first_order_label") or state["subtrees"][cs_id].get("first_order_label"),
+                        "graph": _serialize(data["partial_graph"]),
+                        "complete": False,
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    })
             elif ev.kind == "merged_graph_built" and data.get("merged_graph"):
                 state["merged_graph"] = _serialize(data["merged_graph"])
             elif ev.kind == "stage_complete" and data.get("stage") == 7 and data.get("pruned_graph"):
@@ -130,7 +145,6 @@ def _run_in_thread(run_id: str, req: AnalyzeRequest) -> None:
             max_analogs_per_node=req.max_analogs_per_node,
             similarity_threshold=req.similarity_threshold,
             use_moderator=req.use_moderator,
-            use_logic_verifier=req.use_logic_verifier,
             run_scenarios=req.run_scenarios,
             portfolio_context=req.portfolio_context,
             run_id=run_id,

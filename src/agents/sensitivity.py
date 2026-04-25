@@ -5,21 +5,12 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import pandas as pd
 
 from src.config import LOGS_DIR, MODEL, PROMPTS_DIR
 from src.types import CaseStudy, Edge, Evidence, Node, ToolBundle, ToolError
-
-# LogicCheck callable: receives (parent, candidate, mechanism) and returns
-# {"ok": bool, "reason": str} or None if the check could not be run.
-LogicCheck = Callable[[Node, Node, str], Optional[dict]]
-
-# Confidence floor when LogicVerifier passes — out-of-sample primary signal.
-LOGIC_PASS_FLOOR = 0.5
-# Confidence cap when LogicVerifier fails — structural problem with the chain.
-LOGIC_FAIL_CAP = 0.2
 
 logger = logging.getLogger(__name__)
 
@@ -251,18 +242,14 @@ def score_edge(
     *,
     tools: ToolBundle,
     model: str = MODEL,
-    logic_check: Optional[LogicCheck] = None,
     run_id: Optional[str] = None,
 ) -> EdgeScore:
     """Score an edge from `parent` to `candidate` within `case_study`.
 
     Two model calls: propose data refs, then score given summary stats.
 
-    `logic_check`, when provided, is a callable that returns a `{"ok", "reason"}`
-    dict (or None on failure). It is treated as the **primary** out-of-sample
-    validity signal: logic-passing edges are floored at confidence 0.5 even
-    without empirical data; logic-failing edges are capped at 0.2 and marked
-    drop. When `logic_check` is None, falls back to PRIORS_ONLY_CAP behavior.
+    Logic validation is handled downstream by the Moderator (Pass 3.5 of its
+    4-pass judgment in stage 5), not per-candidate during tree building.
     """
     summaries, supporting = _gather_evidence(
         parent, candidate, mechanism, case_study, tools, model
@@ -317,55 +304,21 @@ def score_edge(
         if note_extra:
             ev.note = (ev.note + "; " + note_extra) if ev.note else note_extra
 
-    # LogicVerifier as primary out-of-sample signal. Run it before the data
-    # cap so logic alone can sustain confidence when empirical data is thin.
-    logic_ok: Optional[bool] = None
-    logic_reason: str = ""
-    if logic_check is not None:
-        try:
-            result = logic_check(parent, candidate, mechanism)
-        except Exception as exc:
-            logger.warning("logic_check raised: %s", exc)
-            result = None
-        if isinstance(result, dict):
-            logic_ok = bool(result.get("ok"))
-            logic_reason = str(result.get("reason") or "")[:200]
-            note = f"logic {'passed' if logic_ok else 'failed'}: {logic_reason}"
-            supporting.append(
-                Evidence(kind="logic_check", ref="logic_verifier", note=note)
-            )
-
-    has_usable_data = any(
-        ev.payload for ev in supporting if ev.kind != "logic_check"
-    )
-
-    if logic_ok is True:
-        # Logic passes: floor confidence at LOGIC_PASS_FLOOR. Empirical data
-        # may have already pushed it higher; we never lower it here.
-        if conf < LOGIC_PASS_FLOOR:
-            conf = LOGIC_PASS_FLOOR
-    elif logic_ok is False:
-        # Logic fails: this is a structural problem. Cap confidence and force drop.
-        if conf > LOGIC_FAIL_CAP:
-            conf = LOGIC_FAIL_CAP
-    elif not has_usable_data and conf > PRIORS_ONLY_CAP:
-        # No logic check, no data: classic priors-only cap.
+    # Cap confidence if no usable numeric data was returned. Stage 5 Moderator
+    # picks up structural validity downstream.
+    has_usable_data = any(ev.payload for ev in supporting)
+    if not has_usable_data and conf > PRIORS_ONLY_CAP:
         conf = PRIORS_ONLY_CAP
 
     # Hard rubric: drop if confidence < 0.3 AND sensitivity < 0.2.
     rubric_keep = not (conf < DROP_CONF_BELOW and sens < DROP_SENS_BELOW)
-    logic_keep = logic_ok is not False  # explicit False forces a drop
     model_keep = bool(parsed.get("keep", True))
-    keep = rubric_keep and model_keep and logic_keep
+    keep = rubric_keep and model_keep
     keep_reason = str(parsed.get("keep_reason") or "").strip()
     if not rubric_keep:
         keep_reason = (
             f"rubric drop: sensitivity={sens:.2f}, confidence={conf:.2f}. "
             + keep_reason
-        ).strip()
-    if not logic_keep:
-        keep_reason = (
-            f"logic check failed: {logic_reason}. " + keep_reason
         ).strip()
 
     score = EdgeScore(

@@ -520,12 +520,13 @@ def test_demo_pipeline_executes_full_loop():
     assert leaves
     assert all(result.subtree.nodes[lid].asset_class for lid in leaves)
 
-    # Adversary actually fired: at least one drop and one merge in the trace.
+    # Challenger fired and produced at least one drop. Merging now happens
+    # at the propose step (via existing_id in candidate JSON), so the challenger
+    # no longer emits "merge" actions itself.
     challenges = [c for c in model.calls if c["kind"] == "challenge"]
     assert challenges
     actions_seen = " ".join(c["response_excerpt"] for c in challenges)
     assert '"drop"' in actions_seen, "expected at least one drop outcome"
-    assert '"merge"' in actions_seen, "expected at least one merge outcome"
 
     # All four call kinds were exercised at least once.
     kinds = {c["kind"] for c in model.calls}

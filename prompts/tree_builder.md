@@ -10,7 +10,7 @@ You are not asked to predict the future. You are asked to produce *structured, o
 
 ### PROPOSE_CHILDREN
 
-Given a case study, a parent node, and any sibling nodes already proposed under the same parent, return 3 to 5 candidate child nodes.
+Given a case study, a parent node, sibling nodes already proposed under the same parent, **and the full list of every node already in the subtree**, return 3 to 5 candidate child nodes. Each candidate is either a new node or a merge with an existing node (multi-parent DAG).
 
 #### Inputs
 
@@ -18,6 +18,22 @@ Given a case study, a parent node, and any sibling nodes already proposed under 
 - `Triggering event`: the root cause for this case study.
 - `Parent node`: layer, label, description.
 - `Existing siblings`: candidates already accepted under this parent. Do not duplicate.
+- `All existing nodes`: every node already in the subtree, with id and label. **Use these to merge instead of creating duplicates.** A "S&P 500 drawdown" candidate under one parent should merge with an "S&P 500 selloff" node already at L1, not create a new copy. The graph is a DAG, multi-parent is fine and desirable.
+
+#### Decision per candidate: NEW or MERGE
+
+For each candidate, choose:
+
+- **NEW** (default): set `existing_id: null`. Provide all fields (label, description, asset_class, mechanism). The candidate becomes a new downstream node.
+- **MERGE**: set `existing_id` to the id of an existing node. Only `mechanism` is required (describing the link from this parent to the existing node). The label/description/asset_class are inherited from the existing node.
+
+When to merge:
+- Candidate names the same observable variable as an existing node ("S&P 500 selloff" and "S&P 500 drawdown" — same).
+- Candidate is a more or less specific phrasing of an existing node ("US consumer confidence collapse" merges with "US consumer confidence drops").
+
+When to create new:
+- Candidate is a related but distinct variable ("S&P 500 selloff" vs "Russell 2000 selloff" — different).
+- Candidate is on a fundamentally different timeframe or asset class.
 
 #### Reasoning steps
 

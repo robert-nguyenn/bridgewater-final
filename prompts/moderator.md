@@ -33,6 +33,22 @@ Two judgments to make:
 
 2. **Whose cited evidence is more specific?** Compare the `cited_evidence` lists. A named FRED series + dated episode beats an unsourced "markets often". Generic citations from both sides → tie.
 
+### Pass 3.5: Independent logic check
+
+Even if neither side raised it, scan the edge for these common LLM reasoning failures. If you spot one **the adversary missed**, you can drop the edge on that basis. Set `independent_logic_failure` to the category name; otherwise leave it null.
+
+- `reverse_causation` — the chain claims A → B but the actual direction is B → A
+- `spurious_correlation` — co-movement cited without naming a mechanism
+- `selection_bias` — only confirming episodes cited; obvious counter-episodes ignored
+- `base_rate_neglect` — single episode generalized to "always" without considering how often the link holds
+- `fabricated_evidence` — a cited series id, ticker, or episode does not exist or doesn't say what the chain claims
+- `levels_confusion` — micro-level effect (one firm, one rate move) inflated to macro (entire index) without a named aggregation, or vice versa
+- `affirming_consequent` — from "A causes B" and "B observed", concludes "A happened"
+- `mechanism_mismatch` — the named mechanism does not actually link source to destination
+- `hidden_assumption` — an unstated precondition is doing the work
+
+If a logic failure is present, lean drop unless the defender's response *specifically* neutralized it.
+
 ### Pass 4: Decide and adjust confidence
 
 Use the table below. Default toward keep when in doubt — defender wins ties.
@@ -59,11 +75,15 @@ Return exactly one JSON object inside a ```json fenced block. No prose after.
   "defender_strongest_response": "one sentence restating the defender's strongest concrete response, or 'abstract / no concrete response'",
   "defender_addresses_directly": true | false,
   "evidence_winner": "adversary" | "defender" | "tie",
+  "independent_logic_failure": null | "reverse_causation" | "spurious_correlation" | "selection_bias" | "base_rate_neglect" | "fabricated_evidence" | "levels_confusion" | "affirming_consequent" | "mechanism_mismatch" | "hidden_assumption",
   "decision": "keep" | "drop",
   "confidence_adjustment": -0.30 to +0.20,
-  "reasoning": "two sentences naming what specifically tipped the call. Reference Pass 3 outcomes, not just scores."
+  "synthesis": "one or two sentences. For KEPT edges: the strongest reconciled argument for the edge as it stands, accounting for the adversary's concession-worthy points. For DROPPED edges: the strongest reconciled case for dropping. This is the audit answer when someone asks 'why does this edge survive?' or 'why was this dropped?' Empty string only if both sides were too abstract for any synthesis.",
+  "reasoning": "two sentences naming what specifically tipped the call. Reference Pass 3 / Pass 3.5 outcomes, not just scores."
 }
 ```
+
+The `synthesis` field is the **headline story** for surviving edges. It should read as a standalone justification a human can quote without seeing the adversary or defender transcripts. Do not just rephrase the defender; if the adversary scored a point that downgrades the link, fold that downgrading into the synthesis ("X holds, but with weaker confidence than Y because of Z").
 
 `confidence_adjustment` modifies the edge's stored confidence (clamped downstream to [0, 1]):
 - 0.0 (default) — keep original.

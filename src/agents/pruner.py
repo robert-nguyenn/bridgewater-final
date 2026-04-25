@@ -43,9 +43,14 @@ def run(
             on_event({"kind": kind, **data})
 
     # 1. Edge debate filter. Moderator verdict wins when present; otherwise
-    # fall back to the score-margin rule.
+    # fall back to the score-margin rule. Bridge edges (historical analogs)
+    # are exempt from debate-based pruning since they're meta-references,
+    # not causal claims; their fate is governed by case-study similarity.
     surviving_edges: list[Edge] = []
     for edge in graph.edges:
+        if edge.mechanism and edge.mechanism.startswith("historical analog:"):
+            surviving_edges.append(edge)
+            continue
         debate = debates.get(edge.id)
         if debate is not None:
             verdict = getattr(debate, "verdict", None)

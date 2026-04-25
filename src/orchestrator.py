@@ -4,6 +4,8 @@ import argparse
 import copy
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Optional
@@ -93,61 +95,53 @@ class PipelineResult:
     comparator_results: dict[str, ComparatorResult] = field(default_factory=dict)
     case_study_to_first_order: dict[str, str] = field(default_factory=dict)
     tail_scenarios: list[TailScenario] = field(default_factory=list)
+    chain_verifications: dict[str, Any] = field(default_factory=dict)
     progress_events: list[ProgressEvent] = field(default_factory=list)
     run_id: Optional[str] = None
 
 
-def _make_logic_check(
-    *, model: str, client: Any, run_id: Optional[str] = None
-):
-    """Factory that returns a `LogicCheck` callable for stage 3 sensitivity.
 
-    For each (parent, candidate, mechanism), constructs a single-edge synthetic
-    chain and asks LogicVerifier to assess local validity (passes 1, 2, 4 of
-    the 4-pass CoT; pass 3 is trivial for a length-1 chain). Returns
-    `{"ok": bool, "reason": str}` or None on failure (sensitivity falls back
-    to its priors-only cap behavior in that case).
-    """
-    def check(parent: Node, candidate: Node, mechanism: str) -> Optional[dict]:
-        try:
-            edge = Edge(
-                src=parent.id, dst=candidate.id, mechanism=mechanism,
-                sensitivity=0.0, confidence=0.0,
-            )
-            nodes = {parent.id: parent, candidate.id: candidate}
-            result = logic_verifier.run(
-                [edge], nodes=nodes, model=model, client=client
-            )
-            return {"ok": result.ok, "reason": result.reason}
-        except Exception as exc:
-            logger.warning("logic check failed: %s", exc)
-            return None
-    return check
+
+DEFAULT_DEBATE_WORKERS = 4
+DEFAULT_SUBTREE_WORKERS = 4
 
 
 def run_adversarial_debate(
     graph: CausalGraph,
     *,
+    only_edges: Optional[list[Edge]] = None,
     include_nodes: bool = False,
     use_moderator: bool = True,
     model: str = MODEL,
     client: Any = None,
     run_id: Optional[str] = None,
     on_progress: Optional[ProgressCallback] = None,
+    max_workers: int = DEFAULT_DEBATE_WORKERS,
 ) -> dict[str, Debate]:
-    """Stage 5. AdversaryAgent → DefenderAgent → optional ModeratorAgent on every edge.
+    """AdversaryAgent → DefenderAgent → optional ModeratorAgent on edges.
 
-    When `use_moderator=True` (default), an independent judge reads both
-    transcripts and returns a final keep/drop decision plus a confidence
-    adjustment. This decision drives pruning instead of the raw score margin.
+    The adv→def→mod chain stays sequential within each edge (the moderator
+    needs both transcripts), but multiple edges debate concurrently via a
+    ThreadPoolExecutor. Anthropic HTTP calls release the GIL so this is real
+    parallelism.
+
+    When `only_edges` is None, debates every edge in the graph (the original
+    stage 5 behavior). When provided, debates that subset only.
+
+    `graph` is required for node context (labels/descriptions) in agent prompts.
     """
     debates: dict[str, Debate] = {}
+    debates_lock = threading.Lock()
 
     def emit(kind: str, message: str, **data: Any) -> None:
         if on_progress is not None:
             on_progress(ProgressEvent(kind=kind, message=message, data=data))
 
-    for edge in graph.edges:
+    target_edges = only_edges if only_edges is not None else graph.edges
+    if not target_edges and not include_nodes:
+        return debates
+
+    def _debate_one_edge(edge: Edge) -> None:
         critique = adversary.run(edge, nodes=graph.nodes, model=model, client=client)
         rebuttal = defender.run(
             edge, critique, nodes=graph.nodes, model=model, client=client
@@ -158,18 +152,20 @@ def run_adversarial_debate(
                 edge, critique, rebuttal,
                 nodes=graph.nodes, model=model, client=client, run_id=run_id,
             )
-            # Apply confidence_adjustment to the edge in-place (clamped).
             if verdict.confidence_adjustment != 0.0:
+                # Each edge object is exclusive to this future, so the in-place
+                # mutation is safe without a lock.
                 edge.confidence = max(0.0, min(1.0, edge.confidence + verdict.confidence_adjustment))
-        debates[edge.id] = Debate(
-            target_id=edge.id, critique=critique, rebuttal=rebuttal, verdict=verdict
-        )
+        d = Debate(target_id=edge.id, critique=critique, rebuttal=rebuttal, verdict=verdict)
+        with debates_lock:
+            debates[edge.id] = d
         src_label = graph.nodes[edge.src].label if edge.src in graph.nodes else edge.src
         dst_label = graph.nodes[edge.dst].label if edge.dst in graph.nodes else edge.dst
         decision = verdict.decision if verdict else ("keep" if rebuttal.score >= critique.score else "drop")
         emit(
             "debate_complete",
-            f"{src_label} -> {dst_label}: {decision} (adv {critique.score:.2f} / def {rebuttal.score:.2f}{f' / mod adj {verdict.confidence_adjustment:+.2f}' if verdict else ''})",
+            f"{src_label} -> {dst_label}: {decision} (adv {critique.score:.2f} / def {rebuttal.score:.2f}"
+            f"{f' / mod adj {verdict.confidence_adjustment:+.2f}' if verdict else ''})",
             edge_id=edge.id,
             adversary_score=critique.score,
             defender_score=rebuttal.score,
@@ -178,8 +174,15 @@ def run_adversarial_debate(
             moderator_adjustment=verdict.confidence_adjustment if verdict else 0.0,
         )
 
+    if target_edges:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_debate_one_edge, e) for e in target_edges]
+            for fut in as_completed(futures):
+                fut.result()  # propagate exceptions
+
     if include_nodes:
-        for node in graph.nodes.values():
+        # Node-level debates also run concurrently.
+        def _debate_one_node(node: Node) -> None:
             critique = adversary.run(node, nodes=graph.nodes, model=model, client=client)
             rebuttal = defender.run(
                 node, critique, nodes=graph.nodes, model=model, client=client
@@ -190,9 +193,16 @@ def run_adversarial_debate(
                     node, critique, rebuttal,
                     nodes=graph.nodes, model=model, client=client, run_id=run_id,
                 )
-            debates[node.id] = Debate(
+            d = Debate(
                 target_id=node.id, critique=critique, rebuttal=rebuttal, verdict=verdict
             )
+            with debates_lock:
+                debates[node.id] = d
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_debate_one_node, n) for n in graph.nodes.values()]
+            for fut in as_completed(futures):
+                fut.result()
 
     return debates
 
@@ -208,7 +218,6 @@ def run_pipeline(
     max_first_order: int = 4,
     max_analogs_per_node: int = 4,
     similarity_threshold: float = 0.2,
-    use_logic_verifier: bool = True,
     use_moderator: bool = True,
     run_scenarios: bool = True,
     portfolio_context: str = "",
@@ -238,12 +247,6 @@ def run_pipeline(
         tools = make_default_tools()
     today = today or date.today()
     run_id = run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    # LogicVerifier as primary out-of-sample signal. Threaded into stage 3.
-    logic_check = (
-        _make_logic_check(model=model, client=client, run_id=run_id)
-        if use_logic_verifier else None
-    )
 
     # ------------------------------------------------------------------
     # Stage 1
@@ -275,7 +278,7 @@ def run_pipeline(
     )
 
     # ------------------------------------------------------------------
-    # Stages 2 + 3
+    # Stages 2 + 3 — parallel
     # ------------------------------------------------------------------
     emit(
         "stage_start",
@@ -284,81 +287,195 @@ def run_pipeline(
     )
     case_studies: list[CaseStudy] = []
     case_study_to_first_order: dict[str, str] = {}
+    all_debates: dict[str, Debate] = {}  # collected from per-layer debates + stage 5 trunk
+    state_lock = threading.Lock()  # guards case_studies + case_study_to_first_order
+    debates_lock = threading.Lock()  # guards all_debates updates
 
-    for fo_node in first_order:
+    # 2a) Run AnalogSearch in parallel across first-order nodes.
+    def _search_for_fo(fo_node: Node) -> tuple[Node, list]:
         emit(
             "analog_search_start",
             f"  AnalogSearch for {fo_node.label!r}",
             node_id=fo_node.id,
             label=fo_node.label,
         )
-        episodes = analog_search.run(
+        eps = analog_search.run(
             fo_node, tools=tools, model=model, client=client, run_id=run_id
         )
-        chosen = episodes[:max_analogs_per_node]
+        chosen = eps[:max_analogs_per_node]
         emit(
             "analog_search_complete",
-            f"    found {len(episodes)} episodes, taking top {len(chosen)}",
+            f"    found {len(eps)} episodes for {fo_node.label!r}, taking top {len(chosen)}",
             node_id=fo_node.id,
-            n_found=len(episodes),
+            n_found=len(eps),
             n_taken=len(chosen),
         )
+        return fo_node, chosen
 
+    with ThreadPoolExecutor(max_workers=DEFAULT_SUBTREE_WORKERS) as executor:
+        analog_futures = [executor.submit(_search_for_fo, fo) for fo in first_order]
+        analog_results: list[tuple[Node, list]] = [
+            f.result() for f in as_completed(analog_futures)
+        ]
+
+    # 2b) Build the (fo_node, case_study) build tasks.
+    build_tasks: list[tuple[Node, CaseStudy]] = []
+    for fo_node, chosen in analog_results:
         for ep in chosen:
             cs = _build_case_study_from_episode(ep, tools)
             if cs is None:
                 continue
             emit(
                 "case_study_started",
-                f"    Building subtree for case study {cs.name!r} ({cs.date_range[0]} to {cs.date_range[1]})",
+                f"    Queued subtree {cs.name!r} ({cs.date_range[0]} to {cs.date_range[1]}) under {fo_node.label!r}",
                 case_study_id=cs.id,
                 name=cs.name,
                 first_order_id=fo_node.id,
             )
-            cs = tree_builder.build_subtree(
-                cs, tools=tools, model=model,
-                logic_check=logic_check, run_id=run_id,
-            )
-            case_studies.append(cs)
-            case_study_to_first_order[cs.id] = fo_node.id
+            build_tasks.append((fo_node, cs))
+
+    # 3) Build subtrees in parallel. Each subtree's per-layer debate runs its
+    # own ThreadPoolExecutor (small max_workers within), so the outer pool
+    # stays modest to avoid thread explosion. Total threads ≈ outer × inner.
+    def _build_one_subtree(fo_node: Node, cs: CaseStudy) -> tuple[Node, CaseStudy]:
+        _cs_id_capt = cs.id
+        _cs_name_capt = cs.name
+        _fo_id_capt = fo_node.id
+        _fo_label_capt = fo_node.label
+
+        def _on_subtree_event(sub_ev: dict[str, Any]) -> None:
+            sub_kind = sub_ev.get("kind", "")
+            forwarded = {k: v for k, v in sub_ev.items() if k != "kind"}
+            forwarded.setdefault("case_study_id", _cs_id_capt)
+            forwarded.setdefault("name", _cs_name_capt)
+            forwarded.setdefault("first_order_id", _fo_id_capt)
+            forwarded.setdefault("first_order_label", _fo_label_capt)
+            if sub_kind == "subtree_candidate_added":
+                emit(
+                    "subtree_candidate_added",
+                    f"      + L{forwarded.get('layer')} {forwarded.get('candidate_label', '')!r} "
+                    f"under {forwarded.get('parent_label', '')!r}",
+                    **forwarded,
+                )
+            elif sub_kind == "subtree_candidate_merged":
+                emit(
+                    "subtree_candidate_merged",
+                    f"      ↪ L{forwarded.get('layer')} reuse {forwarded.get('existing_label', '')!r} "
+                    f"under {forwarded.get('parent_label', '')!r} (multi-parent)",
+                    **forwarded,
+                )
+            elif sub_kind == "subtree_layer_start":
+                emit(
+                    "subtree_layer_start",
+                    f"    layer {forwarded.get('layer')} of {_cs_name_capt!r}",
+                    **forwarded,
+                )
+            elif sub_kind == "subtree_init":
+                emit(
+                    "subtree_init",
+                    f"    initialized {_cs_name_capt!r}",
+                    **forwarded,
+                )
+
+        def _on_layer_complete(
+            subtree_graph: CausalGraph,
+            layer_edges: list[Edge],
+            layer: int,
+        ) -> set[str]:
+            if not layer_edges:
+                return set()
             emit(
-                "case_study_built",
-                f"      subtree: {len(cs.subtree.nodes)} nodes, {len(cs.subtree.edges)} edges",
-                case_study_id=cs.id,
-                name=cs.name,
-                first_order_id=fo_node.id,
-                first_order_label=fo_node.label,
-                n_nodes=len(cs.subtree.nodes),
-                n_edges=len(cs.subtree.edges),
-                subtree=copy.deepcopy(cs.subtree),
+                "subtree_layer_debate_start",
+                f"    debating {len(layer_edges)} new edges at layer {layer} of {_cs_name_capt!r}",
+                case_study_id=_cs_id_capt,
+                layer=layer,
+                n_edges=len(layer_edges),
             )
+            # Inner pool is small to avoid thread explosion under outer pool.
+            layer_debates = run_adversarial_debate(
+                subtree_graph,
+                only_edges=layer_edges,
+                model=model,
+                client=client,
+                run_id=run_id,
+                on_progress=on_progress,
+                use_moderator=use_moderator,
+                max_workers=2,
+            )
+            with debates_lock:
+                all_debates.update(layer_debates)
+            drop_ids = {
+                eid for eid, d in layer_debates.items() if not d.survives
+            }
+            emit(
+                "subtree_layer_debate_complete",
+                f"    debate done at layer {layer}: {len(drop_ids)}/{len(layer_edges)} dropped",
+                case_study_id=_cs_id_capt,
+                layer=layer,
+                n_dropped=len(drop_ids),
+                n_kept=len(layer_edges) - len(drop_ids),
+            )
+            return drop_ids
+
+        cs_built = tree_builder.build_subtree(
+            cs, tools=tools, model=model, run_id=run_id,
+            on_progress=_on_subtree_event,
+            on_layer_complete=_on_layer_complete,
+        )
+        emit(
+            "case_study_built",
+            f"      subtree {_cs_name_capt!r}: {len(cs_built.subtree.nodes)} nodes, {len(cs_built.subtree.edges)} edges",
+            case_study_id=cs_built.id,
+            name=cs_built.name,
+            first_order_id=_fo_id_capt,
+            first_order_label=_fo_label_capt,
+            n_nodes=len(cs_built.subtree.nodes),
+            n_edges=len(cs_built.subtree.edges),
+            subtree=copy.deepcopy(cs_built.subtree),
+        )
+        return fo_node, cs_built
+
+    with ThreadPoolExecutor(max_workers=DEFAULT_SUBTREE_WORKERS) as executor:
+        subtree_futures = [
+            executor.submit(_build_one_subtree, fo, cs) for fo, cs in build_tasks
+        ]
+        for fut in as_completed(subtree_futures):
+            try:
+                fo_node_done, cs_done = fut.result()
+            except Exception as exc:
+                logger.warning("subtree build failed: %s", exc)
+                continue
+            with state_lock:
+                case_studies.append(cs_done)
+                case_study_to_first_order[cs_done.id] = fo_node_done.id
 
     emit(
         "stage_complete",
-        f"Stages 2+3 done: {len(case_studies)} case-study subtrees built",
+        f"Stages 2+3 done: {len(case_studies)} case-study subtrees built (parallel)",
         stage=3,
         n_case_studies=len(case_studies),
     )
 
     # ------------------------------------------------------------------
-    # Stage 5: Adversarial debate
+    # Stage 5: Adversarial debate on the TRUNK only.
+    # Subtree edges were already debated layer-by-layer in stage 3 via the
+    # on_layer_complete callback, which dropped losers before each next
+    # layer expanded.
     # ------------------------------------------------------------------
-    emit("stage_start", "Stage 5: Adversarial debate on trunk + each subtree", stage=5)
-    all_debates = run_adversarial_debate(
+    emit(
+        "stage_start",
+        "Stage 5: Adversarial debate on trunk (subtrees already debated per-layer)",
+        stage=5,
+    )
+    trunk_debates = run_adversarial_debate(
         graph, model=model, client=client, run_id=run_id,
         on_progress=on_progress, use_moderator=use_moderator,
     )
-    for cs in case_studies:
-        all_debates.update(
-            run_adversarial_debate(
-                cs.subtree, model=model, client=client, run_id=run_id,
-                on_progress=on_progress, use_moderator=use_moderator,
-            )
-        )
+    all_debates.update(trunk_debates)
     n_kept = sum(1 for d in all_debates.values() if d.survives)
     emit(
         "stage_complete",
-        f"Stage 5 done: {len(all_debates)} debates ({n_kept} edges defender-favored)",
+        f"Stage 5 done: {len(all_debates)} total debates ({n_kept} survived)",
         stage=5,
         n_debates=len(all_debates),
         n_defender_wins=n_kept,
@@ -443,6 +560,48 @@ def run_pipeline(
         n_edges=len(graph.edges),
         merged_graph=copy.deepcopy(pre_prune_graph),
     )
+
+    # Stage 7.5: chain-level logic verification on the merged graph.
+    # Walks root-to-leaf paths and checks cross-edge coherence (sign
+    # composition, magnitude leaps, equivocation, time horizon, missing
+    # transmission) — issues the per-edge Moderator can't see in isolation.
+    # Edges flagged as the offending step in a failing chain are dropped.
+    chain_verifications: dict[str, Any] = {}
+    chain_drop_ids: set[str] = set()
+    if graph.edges:
+        emit("stage_chain_verify_start", "  Stage 7.5: chain-level logic verification")
+        chain_verifications = logic_verifier.verify_paths(
+            graph,
+            model=model,
+            client=client,
+            run_id=run_id,
+            max_paths=20,
+            min_path_length=2,
+            max_workers=4,
+        )
+        for chain_key, vresult in chain_verifications.items():
+            if vresult.ok or vresult.failed_edge_idx is None:
+                continue
+            edge_ids_in_chain = chain_key.split("->")
+            if 0 <= vresult.failed_edge_idx < len(edge_ids_in_chain):
+                bad_id = edge_ids_in_chain[vresult.failed_edge_idx]
+                chain_drop_ids.add(bad_id)
+                emit(
+                    "chain_failure",
+                    f"    chain failed: {vresult.failure_category} at edge {vresult.failed_edge_idx} ({vresult.reason[:80]})",
+                    chain=chain_key,
+                    failed_edge_id=bad_id,
+                    failure_category=vresult.failure_category,
+                    reason=vresult.reason,
+                )
+        if chain_drop_ids:
+            graph.edges = [e for e in graph.edges if e.id not in chain_drop_ids]
+        emit(
+            "stage_chain_verify_complete",
+            f"  Chain verify: {len(chain_verifications)} chains, {len(chain_drop_ids)} edges dropped",
+            n_chains=len(chain_verifications),
+            n_dropped=len(chain_drop_ids),
+        )
 
     similarity_by_cs = {cs.id: cs.similarity_score for cs in case_studies}
 
@@ -571,6 +730,7 @@ def run_pipeline(
         comparator_results=comparator_results,
         case_study_to_first_order=case_study_to_first_order,
         tail_scenarios=tail_scenarios,
+        chain_verifications=chain_verifications,
         progress_events=progress_events,
         run_id=run_id,
     )

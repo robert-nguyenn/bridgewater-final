@@ -192,10 +192,84 @@ def macro_snapshot(at: date) -> Union[MacroSnapshot, ToolError]:
     return MacroSnapshot(**snapshot_kwargs)
 
 
+# Reference series for the "what moved during this window" summary the
+# TreeBuilder feeds into its propose prompt. Edit to extend coverage.
+WINDOW_MOVERS_SERIES: list[str] = [
+    "CPIAUCSL",       # headline CPI
+    "PCEPILFE",       # core PCE
+    "DFF",            # fed funds effective
+    "DGS10",          # 10y UST
+    "DGS2",           # 2y UST
+    "DTWEXBGS",       # USD broad index
+    "DCOILWTICO",     # WTI crude
+    "BAMLH0A0HYM2",   # HY OAS
+    "VIXCLS",         # VIX
+    "UNRATE",         # unemployment
+]
+
+
+@disk_cache("fred_window_movers")
+def window_movers(
+    start: date,
+    end: date,
+    series_ids: Optional[list[str]] = None,
+) -> Union[list[dict[str, Any]], ToolError]:
+    """Find which FRED series moved most during ``[start, end]``.
+
+    For each candidate series, computes pre-event mean/std (the 90 days before
+    `start`), then peak deviation during the window in pre-event sigmas. Returns
+    movers ranked by ``abs(peak_z)`` descending, capped at 10 items. Cached.
+
+    Used by TreeBuilder to ground the propose prompt in observed movers."""
+    series_ids = series_ids or WINDOW_MOVERS_SERIES
+    pre_start = start - timedelta(days=90)
+    fetch_end = end + timedelta(days=14)
+
+    movers: list[dict[str, Any]] = []
+    for sid in series_ids:
+        df = fred_get_series(sid, pre_start, fetch_end)
+        if isinstance(df, ToolError):
+            continue
+        s = df["value"].dropna()
+        if isinstance(s, pd.DataFrame):
+            if s.shape[1] == 1:
+                s = s.iloc[:, 0]
+            else:
+                continue
+        if s.empty:
+            continue
+        s.index = pd.to_datetime(s.index)
+        t0 = pd.Timestamp(start)
+        t1 = pd.Timestamp(end)
+        pre = s[s.index < t0]
+        post = s[(s.index >= t0) & (s.index <= t1)]
+        if pre.empty or post.empty or len(pre) < 5:
+            continue
+        pre_mean = float(pre.mean())
+        pre_std = float(pre.std()) if len(pre) > 1 else 0.0
+        if pre_std <= 1e-9:
+            continue
+        deviations = post - pre_mean
+        idx = deviations.abs().idxmax()
+        peak_dev = float(deviations.loc[idx])
+        peak_z = peak_dev / pre_std
+        movers.append({
+            "series_id": sid,
+            "peak_z": round(peak_z, 2),
+            "peak_deviation": round(peak_dev, 4),
+            "direction": "up" if peak_z > 0 else "down",
+        })
+
+    movers.sort(key=lambda m: -abs(m["peak_z"]))
+    return movers[:10]
+
+
 # Re-exports so tests and integrators can introspect the contract.
 __all__ = [
     "fred_get_series",
     "fred_find_extrema",
     "macro_snapshot",
+    "window_movers",
     "MACRO_SNAPSHOT_SERIES",
+    "WINDOW_MOVERS_SERIES",
 ]

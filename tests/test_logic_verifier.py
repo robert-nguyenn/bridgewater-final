@@ -3,186 +3,154 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from src.agents import logic_verifier
-from src.agents._common import extract_json
 from src.agents.logic_verifier import (
-    FAILURE_CATEGORIES,
-    _format_chain,
-    _parse_response,
-    check_score_evidence_consistency,
+    CHAIN_FAILURE_CATEGORIES,
+    ChainVerification,
+    _parse,
+    run,
+    verify_paths,
 )
-from src.types import Edge, Evidence, Node
+from src.types import CausalGraph, Edge, Node
 
 
-def _node(nid: str, label: str, layer: int = 1) -> Node:
-    return Node(id=nid, label=label, description=f"{label} description", layer=layer)
+def _node(nid: str, layer: int = 1) -> Node:
+    return Node(id=nid, label=nid, description=f"{nid} desc", layer=layer)
 
 
-def _edge(src: str, dst: str, sens: float, conf: float, n_evidence: int = 0) -> Edge:
-    ev = [Evidence(kind="fred_series", ref=f"FRED{i}") for i in range(n_evidence)]
-    return Edge(src=src, dst=dst, mechanism="m", sensitivity=sens, confidence=conf, supporting_data=ev)
+def _msg(text: str) -> MagicMock:
+    m = MagicMock()
+    m.content = [MagicMock(text=text)]
+    return m
 
 
-def test_logic_verifier_module_has_run():
+def test_module_has_run_and_verify_paths():
     assert hasattr(logic_verifier, "run")
+    assert hasattr(logic_verifier, "verify_paths")
 
 
-def test_empty_chain_passes_without_api_call():
-    result = logic_verifier.run([], nodes={})
+def test_chain_failure_categories_exact_set():
+    assert CHAIN_FAILURE_CATEGORIES == {
+        "sign_inconsistency",
+        "magnitude_leap",
+        "equivocation",
+        "time_mismatch",
+        "missing_step",
+    }
+
+
+def test_empty_chain_passes_trivially():
+    result = run([], nodes={})
     assert result.ok is True
     assert "empty" in result.reason.lower()
 
 
-def test_format_chain_includes_labels_descriptions_and_mechanism():
-    nodes = {"a": _node("a", "USD strengthens"), "b": _node("b", "Chip ASP rises", layer=2)}
-    chain = [Edge(src="a", dst="b", mechanism="cost pass-through", sensitivity=0.6, confidence=0.7)]
-    text = _format_chain(chain, nodes)
-    assert "USD strengthens" in text
-    assert "Chip ASP rises" in text
-    assert "cost pass-through" in text
-    assert "0.60" in text and "0.70" in text
-
-
-def test_extract_json_from_fenced_block():
-    text = '```json\n{"ok": true, "reason": "fine"}\n```'
-    assert extract_json(text) == {"ok": True, "reason": "fine"}
-
-
-def test_extract_json_falls_back_to_naked_braces():
-    assert extract_json('preamble {"ok": false} trailing') == {"ok": False}
-
-
-def test_extract_json_returns_none_on_garbage():
-    assert extract_json("not json") is None
-
-
-def test_parse_response_handles_full_failure_payload():
-    text = """```json
-{
-  "ok": false,
-  "reason": "step 1 has a magnitude leap",
-  "failed_edge_idx": 1,
-  "failure_category": "magnitude_leap",
-  "step_analyses": [
-    {"edge_idx": 0, "src_label": "A", "dst_label": "B", "mechanism": "m1",
-     "preconditions": [], "sign": "+", "magnitude_class": "small", "horizon": "short",
-     "local_ok": true, "local_reason": ""},
-    {"edge_idx": 1, "src_label": "B", "dst_label": "C", "mechanism": "m2",
-     "preconditions": ["no Fed reaction"], "sign": "+", "magnitude_class": "large",
-     "horizon": "long", "local_ok": false, "local_reason": "small to large with no amplifier"}
-  ]
-}
-```"""
-    result = _parse_response(text)
-    assert result.ok is False
-    assert result.failed_edge_idx == 1
-    assert result.failure_category == "magnitude_leap"
-    assert len(result.step_analyses) == 2
-    assert result.step_analyses[1].local_ok is False
-
-
-def test_parse_response_drops_unknown_failure_category():
-    text = '```json\n{"ok": false, "failure_category": "made_up", "failed_edge_idx": 0}\n```'
-    assert _parse_response(text).failure_category is None
-
-
-def test_parse_response_handles_unparseable_text():
-    result = _parse_response("totally not json")
-    assert result.ok is False
-    assert "parse" in result.reason.lower()
-    assert result.raw_response == "totally not json"
-
-
-def test_failure_categories_includes_score_evidence_mismatch():
-    assert "score_evidence_mismatch" in FAILURE_CATEGORIES
-
-
-# Consistency check tests
-
-def test_consistency_no_issues_for_low_scores():
-    chain = [_edge("a", "b", sens=0.2, conf=0.2)]
-    assert check_score_evidence_consistency(chain) == []
-
-
-def test_consistency_fails_high_confidence_no_evidence():
-    chain = [_edge("a", "b", sens=0.0, conf=0.8, n_evidence=0)]
-    issues = check_score_evidence_consistency(chain)
-    fails = [i for i in issues if i.severity == "fail"]
-    assert any(i.field == "confidence" for i in fails)
-
-
-def test_consistency_fails_high_sensitivity_no_evidence():
-    chain = [_edge("a", "b", sens=0.6, conf=0.0, n_evidence=0)]
-    issues = check_score_evidence_consistency(chain)
-    fails = [i for i in issues if i.severity == "fail"]
-    assert any(i.field == "sensitivity" for i in fails)
-
-
-def test_consistency_warns_high_confidence_one_episode():
-    chain = [_edge("a", "b", sens=0.0, conf=0.7, n_evidence=1)]
-    issues = check_score_evidence_consistency(chain)
-    warnings = [i for i in issues if i.severity == "warning"]
-    assert any("0.6" in i.expected for i in warnings)
-
-
-def test_consistency_warns_very_high_confidence_two_episodes():
-    chain = [_edge("a", "b", sens=0.0, conf=0.9, n_evidence=2)]
-    issues = check_score_evidence_consistency(chain)
-    warnings = [i for i in issues if i.severity == "warning"]
-    assert any("0.85" in i.expected for i in warnings)
-
-
-def test_consistency_clean_with_enough_episodes():
-    chain = [_edge("a", "b", sens=0.5, conf=0.5, n_evidence=2)]
-    assert check_score_evidence_consistency(chain) == []
-
-
-# Run-level integration
-
-def _fake_client_returning(payload_text: str) -> MagicMock:
-    fake_client = MagicMock()
-    fake_msg = MagicMock()
-    fake_msg.content = [MagicMock(text=payload_text)]
-    fake_client.messages.create.return_value = fake_msg
-    return fake_client
-
-
-def test_run_consistency_fail_overrides_llm_pass():
-    """If LLM said ok but consistency check finds a hard fail, result flips to fail."""
-    fake_client = _fake_client_returning(
-        '```json\n{"ok": true, "reason": "looks fine", "step_analyses": []}\n```'
-    )
-    nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
-    chain = [_edge("a", "b", sens=0.0, conf=0.7, n_evidence=0)]  # hard fail
-
-    result = logic_verifier.run(chain, nodes=nodes, client=fake_client)
-    assert result.ok is False
-    assert result.failure_category == "score_evidence_mismatch"
-    assert result.failed_edge_idx == 0
-    assert any(i.severity == "fail" for i in result.consistency_issues)
-
-
-def test_run_warnings_only_does_not_override_llm_pass():
-    """Warning-only consistency issues are surfaced but do not flip ok."""
-    fake_client = _fake_client_returning(
-        '```json\n{"ok": true, "reason": "looks fine", "step_analyses": []}\n```'
-    )
-    nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
-    chain = [_edge("a", "b", sens=0.0, conf=0.7, n_evidence=1)]  # warning only
-
-    result = logic_verifier.run(chain, nodes=nodes, client=fake_client)
+def test_single_edge_chain_passes_trivially():
+    edge = Edge(src="a", dst="b", mechanism="m", sensitivity=0.5, confidence=0.5)
+    result = run([edge], nodes={"a": _node("a"), "b": _node("b")})
     assert result.ok is True
-    assert any(i.severity == "warning" for i in result.consistency_issues)
+    assert "single" in result.reason.lower()
 
 
-def test_run_uses_injected_client_and_passes_system_prompt():
-    fake_client = _fake_client_returning(
-        '```json\n{"ok": true, "reason": "fine", "step_analyses": []}\n```'
+def test_parse_pass():
+    text = '```json\n{"ok": true, "reason": "coherent", "failed_edge_idx": null, "failure_category": null}\n```'
+    v = _parse(text)
+    assert v.ok is True
+    assert v.failed_edge_idx is None
+
+
+def test_parse_fail_with_known_category():
+    text = '```json\n{"ok": false, "reason": "magnitude jumps", "failed_edge_idx": 1, "failure_category": "magnitude_leap"}\n```'
+    v = _parse(text)
+    assert v.ok is False
+    assert v.failure_category == "magnitude_leap"
+    assert v.failed_edge_idx == 1
+
+
+def test_parse_drops_unknown_category():
+    text = '```json\n{"ok": false, "failure_category": "made_up", "failed_edge_idx": 0}\n```'
+    v = _parse(text)
+    assert v.failure_category is None
+
+
+def test_parse_unparseable():
+    v = _parse("not json")
+    assert v.ok is False
+    assert "parse" in v.reason.lower()
+
+
+def test_run_with_mocked_client():
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = _msg(
+        '```json\n{"ok": false, "reason": "magnitude leap at step 1", "failed_edge_idx": 1, "failure_category": "magnitude_leap"}\n```'
     )
-    nodes = {"a": _node("a", "A"), "b": _node("b", "B", layer=2)}
-    chain = [_edge("a", "b", sens=0.2, conf=0.2)]
-
-    logic_verifier.run(chain, nodes=nodes, client=fake_client)
+    nodes = {"a": _node("a", 0), "b": _node("b", 1), "c": _node("c", 2)}
+    chain = [
+        Edge(src="a", dst="b", mechanism="m1", sensitivity=0.3, confidence=0.4),
+        Edge(src="b", dst="c", mechanism="m2", sensitivity=0.9, confidence=0.5),
+    ]
+    result = run(chain, nodes=nodes, client=fake_client)
+    assert result.ok is False
+    assert result.failure_category == "magnitude_leap"
     fake_client.messages.create.assert_called_once()
-    call_kwargs = fake_client.messages.create.call_args.kwargs
-    assert "system" in call_kwargs
-    assert "lean" in call_kwargs["system"].lower()
+
+
+def test_verify_paths_empty_graph():
+    assert verify_paths(CausalGraph()) == {}
+
+
+def test_verify_paths_skips_short_paths():
+    fake_client = MagicMock()
+    nodes = {"root": _node("root", 0), "a": _node("a", 1)}
+    graph = CausalGraph(
+        nodes=nodes,
+        edges=[Edge(src="root", dst="a", mechanism="m", sensitivity=0.5, confidence=0.5, id="e1")],
+        root="root",
+    )
+    results = verify_paths(graph, client=fake_client, min_path_length=2)
+    # Only one path of length 1 exists; min_path_length=2 should skip it.
+    assert results == {}
+    fake_client.messages.create.assert_not_called()
+
+
+def test_verify_paths_runs_on_long_chain():
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = _msg(
+        '```json\n{"ok": true, "reason": "fine", "failed_edge_idx": null, "failure_category": null}\n```'
+    )
+    nodes = {
+        "root": _node("root", 0),
+        "a": _node("a", 1),
+        "b": _node("b", 2),
+        "c": _node("c", 3),
+    }
+    edges = [
+        Edge(src="root", dst="a", mechanism="m1", sensitivity=0.5, confidence=0.5, id="e1"),
+        Edge(src="a", dst="b", mechanism="m2", sensitivity=0.5, confidence=0.5, id="e2"),
+        Edge(src="b", dst="c", mechanism="m3", sensitivity=0.5, confidence=0.5, id="e3"),
+    ]
+    graph = CausalGraph(nodes=nodes, edges=edges, root="root")
+    results = verify_paths(graph, client=fake_client, min_path_length=2, max_workers=2)
+    assert len(results) == 1
+    assert all(r.ok for r in results.values())
+
+
+def test_verify_paths_picks_longest_paths_first():
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = _msg(
+        '```json\n{"ok": true, "reason": "x"}\n```'
+    )
+    # Build a graph with multiple paths of different lengths.
+    nodes = {f"n{i}": _node(f"n{i}", layer=i) for i in range(5)}
+    nodes["root"] = _node("root", 0)
+    edges = [
+        Edge(src="root", dst="n1", mechanism="m", sensitivity=0.5, confidence=0.5, id="e1"),
+        Edge(src="n1", dst="n2", mechanism="m", sensitivity=0.5, confidence=0.5, id="e2"),
+        Edge(src="n2", dst="n3", mechanism="m", sensitivity=0.5, confidence=0.5, id="e3"),
+        Edge(src="root", dst="n4", mechanism="m", sensitivity=0.5, confidence=0.5, id="e4"),  # short path
+    ]
+    graph = CausalGraph(nodes=nodes, edges=edges, root="root")
+    results = verify_paths(graph, client=fake_client, min_path_length=2, max_paths=10)
+    # Long path (root -> n1 -> n2 -> n3) yields 3 edges; short root -> n4 has 1 edge so skipped.
+    keys = list(results.keys())
+    assert any("e1->e2->e3" in k for k in keys)
+    assert not any(k == "e4" for k in keys)

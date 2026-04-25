@@ -16,6 +16,20 @@ from src.types import Edge, Node, ToolBundle
 VALID_DECISIONS = {"keep", "drop"}
 VALID_EVIDENCE_WINNERS = {"adversary", "defender", "tie"}
 
+# Common LLM reasoning failures the moderator can flag in Pass 3.5 even if
+# the adversary didn't catch them. Replaces the deleted logic_verifier path.
+LOGIC_FAILURE_CATEGORIES = {
+    "reverse_causation",
+    "spurious_correlation",
+    "selection_bias",
+    "base_rate_neglect",
+    "fabricated_evidence",
+    "levels_confusion",
+    "affirming_consequent",
+    "mechanism_mismatch",
+    "hidden_assumption",
+}
+
 
 @dataclass
 class ModeratorVerdict:
@@ -30,10 +44,12 @@ class ModeratorVerdict:
     decision: str  # "keep" | "drop"
     confidence_adjustment: float = 0.0
     reasoning: str = ""
+    synthesis: str = ""  # reconciled argument for the edge (or for dropping it)
     adversary_strongest_point: str = ""
     defender_strongest_response: str = ""
     defender_addresses_directly: bool = True
     evidence_winner: str = "tie"
+    independent_logic_failure: Optional[str] = None  # category name or None
     raw_response: Optional[str] = None
 
 
@@ -62,15 +78,25 @@ def _parse(text: str, fallback_id: str) -> ModeratorVerdict:
     if evidence_winner not in VALID_EVIDENCE_WINNERS:
         evidence_winner = "tie"
 
+    raw_logic = parsed.get("independent_logic_failure")
+    if raw_logic in (None, "", "null"):
+        logic_failure = None
+    elif isinstance(raw_logic, str) and raw_logic in LOGIC_FAILURE_CATEGORIES:
+        logic_failure = raw_logic
+    else:
+        logic_failure = None  # drop unknown categories
+
     return ModeratorVerdict(
         target_id=str(parsed.get("target_id", fallback_id)),
         decision=decision,
         confidence_adjustment=adj,
         reasoning=str(parsed.get("reasoning", "")),
+        synthesis=str(parsed.get("synthesis", "")),
         adversary_strongest_point=str(parsed.get("adversary_strongest_point", "")),
         defender_strongest_response=str(parsed.get("defender_strongest_response", "")),
         defender_addresses_directly=bool(parsed.get("defender_addresses_directly", True)),
         evidence_winner=evidence_winner,
+        independent_logic_failure=logic_failure,
         raw_response=text,
     )
 
