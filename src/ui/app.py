@@ -230,6 +230,34 @@ def _on_progress_factory(run_id: str):
                         "complete": False,
                         "updated_at": datetime.now().isoformat(timespec="seconds"),
                     })
+            elif ev.kind == "subtree_finalized" and data.get("subtree"):
+                # Post-stage-7 reconciled view. Replaces the per-build snapshot
+                # with one that reflects bridges/edges dropped during merge,
+                # chain verify, and prune. Without this the multi-grid keeps
+                # showing pre-prune subtrees long after the merged graph moved on.
+                cs_id = data.get("case_study_id")
+                if cs_id:
+                    state["subtrees"].setdefault(cs_id, {})
+                    state["subtrees"][cs_id].update({
+                        "name": data.get("name") or state["subtrees"][cs_id].get("name"),
+                        "first_order_label": state["subtrees"][cs_id].get("first_order_label"),
+                        "graph": _serialize(data["subtree"]),
+                        "complete": True,
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    })
+            elif ev.kind in ("subtree_dropped_finalize", "subtree_skipped"):
+                # Case study was dropped pre-merge (similarity/applies-today)
+                # or post-merge (no nodes survived). Either way it has no
+                # business in the multi-grid — remove it.
+                cs_id = data.get("case_study_id")
+                if cs_id and cs_id in state["subtrees"]:
+                    del state["subtrees"][cs_id]
+            elif ev.kind == "subtree_dropped":
+                # Pruner-level drop. The pruner emits the cs id under the
+                # `case_study` key (not `case_study_id`), keep both for safety.
+                cs_id = data.get("case_study_id") or data.get("case_study")
+                if cs_id and cs_id in state["subtrees"]:
+                    del state["subtrees"][cs_id]
             elif ev.kind == "merged_graph_built" and data.get("merged_graph"):
                 state["merged_graph"] = _serialize(data["merged_graph"])
             elif ev.kind == "stage_complete" and data.get("stage") == 7 and data.get("pruned_graph"):
@@ -279,6 +307,16 @@ def _run_in_thread(run_id: str, req: AnalyzeRequest) -> None:
             state = _RUN_STATE[run_id]
             state["status"] = {"state": "done", "error": None}
             state["result"] = _serialize_pipeline_result(result)
+            # Drop any subtree entries that never finalized. A complete=False
+            # entry after the pipeline has finished means its build raised
+            # before case_study_built emitted, leaving a stale partial_graph
+            # snapshot that would otherwise sit alongside the real subtrees in
+            # the multi-grid (duplicated case study cards bug).
+            state["subtrees"] = {
+                cs_id: info
+                for cs_id, info in (state.get("subtrees") or {}).items()
+                if info.get("complete")
+            }
         _save_run_state(run_id, force=True)
     except Exception as exc:
         with _LOCK:
