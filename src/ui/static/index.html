@@ -46,13 +46,32 @@
   .center.grid-view { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); grid-auto-rows: minmax(220px, 1fr); gap: 6px; padding: 36px 6px 6px 6px; overflow: auto; align-content: start; }
   .center.grid-view #graph { display: none; }
   .subtree-cell { position: relative; border: 1px solid var(--border); background: var(--bg-2); border-radius: 3px; overflow: hidden; }
-  .subtree-cell .cell-label { position: absolute; top: 3px; left: 3px; background: var(--bg); padding: 2px 6px; font-size: 9px; color: var(--accent); border-radius: 2px; z-index: 5; max-width: 80%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtree-cell .cell-label { position: absolute; top: 3px; left: 3px; background: var(--bg); padding: 2px 6px; font-size: 9px; color: var(--accent); border-radius: 2px; z-index: 5; max-width: 80%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; user-select: none; }
+  .subtree-cell .cell-label:hover { background: var(--accent); color: var(--bg); }
   .subtree-cell .cell-status { position: absolute; top: 3px; right: 3px; background: var(--bg); padding: 1px 5px; font-size: 9px; border-radius: 2px; z-index: 5; }
   .subtree-cell .cell-status.live { color: var(--accent); }
   .subtree-cell .cell-status.complete { color: var(--pos); }
   .subtree-cell svg { width: 100%; height: 100%; display: block; }
-  .header-btn { background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 4px 10px; font-family: inherit; font-size: 10px; cursor: pointer; border-radius: 2px; letter-spacing: 0.5px; }
+  header .title, header .meta { flex-shrink: 0; }
+  .header-controls {
+    margin-left: auto; display: flex; gap: 16px; align-items: center;
+    flex-shrink: 0;
+  }
+  .header-btn {
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 10px; font-family: inherit; font-size: 10px; cursor: pointer;
+    border-radius: 2px; letter-spacing: 0.5px;
+    flex-shrink: 0; white-space: nowrap;
+  }
   .header-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .toggle-label {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    font-size: 11px; color: var(--text); user-select: none;
+    flex-shrink: 0; white-space: nowrap;
+  }
+  .toggle-label input { margin: 0; cursor: pointer; flex-shrink: 0; }
+  .toggle-label:hover { color: var(--accent); }
+  .toggle-label:hover input { accent-color: var(--accent); }
 
   .pane { padding: 14px 16px; border-bottom: 1px solid var(--border); }
   .pane h3 { margin: 0 0 8px 0; font-size: 11px; letter-spacing: 1px;
@@ -136,6 +155,10 @@
   .citation-badge.ok { color: var(--pos); border-color: var(--pos); }
   .citation-badge.missing { color: var(--neg); border-color: var(--neg); text-decoration: line-through; }
   .citation-badge.unverifiable { color: var(--muted); }
+  .row.clickable { cursor: pointer; }
+  .row.clickable:hover { background: var(--bg); }
+  .quote.clickable { cursor: pointer; }
+  .quote.clickable:hover { background: var(--bg); border-left-color: var(--accent); }
   .case-study-row { display: flex; justify-content: space-between; align-items: center;
                     gap: 8px; padding: 5px 0; border-bottom: 1px dotted var(--border); font-size: 11px; }
   .case-study-row .cs-meta { flex: 1; min-width: 0; }
@@ -164,10 +187,7 @@
 <header>
   <div class="title">policy<span> impact mapper</span></div>
   <div class="meta" id="status-meta">idle</div>
-  <div style="margin-left: auto; display: flex; gap: 8px;">
-    <label style="display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); cursor: pointer;">
-      <input type="checkbox" id="toggle-multi" style="margin: 0;" /> Show all subtrees
-    </label>
+  <div class="header-controls">
     <button class="header-btn" id="toggle-right">◀ details</button>
   </div>
 </header>
@@ -175,7 +195,7 @@
   <aside class="left">
     <div class="pane">
       <h3>Event</h3>
-      <textarea id="event" placeholder="e.g. 25% tariff on Chinese semiconductors">25% tariff on Chinese semiconductors</textarea>
+      <textarea id="event" placeholder="e.g. Strait of Hormuz closes for 7+ days">Strait of Hormuz closes for 7+ days</textarea>
       <small style="display: block; margin-top: 4px;">Plain-English policy event. Feeds IdeaAgent and ScenarioAgent.</small>
       <div class="param-grid">
         <div class="param">
@@ -193,10 +213,35 @@
         <button id="run-btn">Run analysis</button>
         <small id="time-note" style="margin-left: 8px;"></small>
       </div>
+      <div style="margin-top: 10px;">
+        <label class="toggle-label" for="toggle-multi" title="Render every tracked case study map side by side as a grid">
+          <input type="checkbox" id="toggle-multi" />
+          <span>Show all case study maps</span>
+        </label>
+      </div>
     </div>
     <div class="pane">
       <h3>Portfolio context (optional)</h3>
-      <textarea id="portfolio" placeholder="e.g. Long NVDA, SOXX, ASML. Short DXY. 60/40 with EM tilt." style="min-height: 60px;"></textarea>
+      <textarea id="portfolio" placeholder="e.g. Long NVDA, SOXX, ASML. Short DXY. 60/40 with EM tilt." style="min-height: 220px;">A balanced 60/40-style portfolio with global diversification, totaling 100%:
+Equities (45%)
+SPY 20% (US large-cap broad market)
+IEFA 10% (developed markets ex-US)
+EEM 8% (emerging markets)
+IWM 4% (US small-cap)
+VNQ 3% (US REITs)
+Fixed Income (30%)
+IEF 12% (US 7-10 year Treasuries)
+TLT 6% (US long-duration Treasuries)
+LQD 6% (US investment-grade credit)
+EMB 6% (emerging market sovereign debt)
+Commodities (10%)
+GLD 5% (gold)
+DBC 5% (broad commodities basket)
+Currencies (10%)
+UUP 5% (long USD)
+FXE 5% (long EUR)
+Cash (5%)
+BIL 5% (T-bills)</textarea>
       <small style="display: block; margin-top: 4px;">Hint to PortfolioAgent. Surfaces tickers relevant to your holdings and names offsets that hedge them.</small>
     </div>
     <div class="pane">
@@ -204,7 +249,10 @@
       <ul class="events" id="events"></ul>
     </div>
     <div class="pane">
-      <h3>Recent runs</h3>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <h3 style="margin: 0;">Recent runs</h3>
+        <button class="header-btn" id="back-to-live" onclick="backToLiveRun()" style="display: none; font-size: 9px; padding: 2px 6px;" title="Switch view back to the run currently in progress">▶ live</button>
+      </div>
       <ul class="run-list" id="runs"></ul>
     </div>
   </aside>
@@ -253,7 +301,10 @@ ToggleRight.addEventListener("click", () => {
 });
 
 ToggleMulti.addEventListener("change", () => {
-  if (currentRunId) pollOnce();  // re-render in the new mode
+  // Instant re-render from cached state. The pollLoop (when live) will
+  // refresh on its next tick anyway; for completed runs the cache is the
+  // authoritative latest state.
+  if (lastIngestedData) ingestState(lastIngestedData);
 });
 
 function setSpinning(active) {
@@ -273,10 +324,12 @@ function setStageTime(secs) {
   StageTagTime.textContent = (secs == null) ? "" : `${secs}s`;
 }
 
-let currentRunId = null;
+let currentRunId = null;     // run currently displayed in the UI
+let liveRunId = null;        // run currently being executed (poll target)
 let currentResult = null;
 let pollTimer = null;
 let lastEventCount = 0;
+let lastIngestedData = null; // cache of the most recent state for instant toggle re-renders
 
 async function fetchJson(url, opts) {
   const r = await fetch(url, opts);
@@ -290,8 +343,11 @@ async function loadRuns() {
     RunsEl.innerHTML = "";
     runs.slice(0, 12).forEach(r => {
       const li = document.createElement("li");
-      li.innerHTML = `<div>${escapeHtml(r.event || "(no event)")}</div>
-                      <div class="rid">${r.run_id} · ${r.state}</div>`;
+      const stateBadge = r.state === "done" ? "✓" : r.state === "running" ? "•" : r.state === "failed" ? "✗" : "·";
+      const isLive = (r.run_id === liveRunId);
+      li.innerHTML = `<div>${stateBadge} ${escapeHtml(r.event || "(no event)")}${isLive ? ' <span style="color: var(--accent);">(live)</span>' : ''}</div>
+                      <div class="rid">${escapeHtml(r.run_id)} · ${escapeHtml(r.state)}${r.has_result ? ' · ✓ result' : ''}</div>`;
+      if (r.run_id === currentRunId) li.style.background = "var(--bg)";
       li.onclick = () => loadRun(r.run_id);
       RunsEl.appendChild(li);
     });
@@ -300,11 +356,30 @@ async function loadRuns() {
 }
 
 async function loadRun(runId) {
+  // Switch the displayed run. Does NOT stop polling for the live run; the
+  // pollLoop checks `currentRunId === liveRunId` before re-rendering.
   currentRunId = runId;
-  StatusMetaEl.textContent = `run ${runId}`;
+  StatusMetaEl.textContent = (runId === liveRunId)
+    ? `run ${runId} (live)`
+    : `run ${runId} (past)`;
   lastEventCount = 0;
   EventsEl.innerHTML = "";
-  pollOnce();
+  delete DrawerEl.dataset.locked;
+  viewingCaseStudyId = null;
+  await pollOnce();
+  loadRuns();
+  updateBackToLiveButton();
+}
+
+function backToLiveRun() {
+  if (!liveRunId) return;
+  loadRun(liveRunId);
+}
+
+function updateBackToLiveButton() {
+  const btn = document.getElementById("back-to-live");
+  if (!btn) return;
+  btn.style.display = (liveRunId && currentRunId !== liveRunId) ? "inline-flex" : "none";
 }
 
 async function startRun() {
@@ -330,8 +405,10 @@ async function startRun() {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(body),
     });
+    liveRunId = run_id;
     currentRunId = run_id;
     StatusMetaEl.textContent = `run ${run_id} (live)`;
+    updateBackToLiveButton();
     pollLoop();
   } catch (e) {
     alert("failed to start: " + e.message);
@@ -347,23 +424,31 @@ function pollLoop() {
   let inflight = false;
 
   async function tick() {
+    if (!liveRunId) return;
     if (inflight) { pollTimer = setTimeout(tick, 800); return; }
     inflight = true;
     try {
-      const data = await fetchJson(`/api/runs/${currentRunId}`);
-      ingestState(data);
-      const secs = Math.round((Date.now() - t0) / 1000);
-      setStageTime(secs);
+      // Poll the LIVE run id always; only render to the UI when the user is
+      // viewing it (otherwise they're inspecting a past run).
+      const data = await fetchJson(`/api/runs/${liveRunId}`);
+      const isViewingLive = (currentRunId === liveRunId);
+      if (isViewingLive) {
+        ingestState(data);
+        const secs = Math.round((Date.now() - t0) / 1000);
+        setStageTime(secs);
+      }
       const state = data.status?.state;
       if (state === "done") {
-        setSpinning(false);
+        if (isViewingLive) setSpinning(false);
         RunBtn.disabled = false;
         loadRuns();
         return;
       }
       if (state === "failed") {
-        setSpinning(false);
-        setStageTag("failed");
+        if (isViewingLive) {
+          setSpinning(false);
+          setStageTag("failed");
+        }
         RunBtn.disabled = false;
         alert("run failed: " + (data.status.error || "unknown"));
         return;
@@ -388,6 +473,7 @@ function pollOnce() {
 }
 
 function ingestState(data) {
+  lastIngestedData = data;
   // Append new events to the live log.
   const events = data.events || [];
   for (let i = lastEventCount; i < events.length; i++) {
@@ -411,9 +497,9 @@ function ingestState(data) {
     }
   }
 
-  // Multi-subtree grid mode: render every tracked subtree side by side.
+  // Multi-map grid mode: render every tracked case study map side by side.
   if (ToggleMulti.checked && Object.keys(subtrees).length > 0) {
-    setStageTag(`ALL SUBTREES (${Object.keys(subtrees).length})`);
+    setStageTag(`ALL CASE STUDY MAPS (${Object.keys(subtrees).length})`);
     renderSubtreeGrid(subtrees, data);
     if (data.result && data.pruned_graph) {
       // After completion, also render the merged result alongside.
@@ -425,18 +511,21 @@ function ingestState(data) {
   CenterEl.classList.remove("grid-view");
   GridCellsEl.style.display = "none";
   GridCellsEl.innerHTML = "";
+  // Force a rebuild on the next multi-view entry. Without this, dataset.ids
+  // would still match the previous set of cells and the grid would render empty.
+  GridCellsEl.removeAttribute("data-ids");
 
   let g = null, tag = null;
   if (viewingCaseStudyId && data.subtrees && data.subtrees[viewingCaseStudyId]) {
     const cs = data.subtrees[viewingCaseStudyId];
     g = cs.graph;
-    tag = `CASE STUDY: ${cs.name || viewingCaseStudyId}`;
+    tag = `CASE STUDY MAP: ${cs.name || viewingCaseStudyId}`;
   }
   else if (data.pruned_graph) { g = data.pruned_graph; tag = "PRUNED"; }
   else if (data.merged_graph) { g = data.merged_graph; tag = "MERGED (pre-prune)"; }
   else if (inProgressSubtree && inProgressSubtree.graph) {
     g = inProgressSubtree.graph;
-    tag = `BUILDING: ${inProgressSubtree.name || "subtree"}`;
+    tag = `BUILDING CASE STUDY MAP: ${inProgressSubtree.name || "(unnamed)"}`;
   }
   else if (data.trunk) { g = data.trunk; tag = "TRUNK + first-order"; }
 
@@ -467,7 +556,9 @@ function renderSubtreeGrid(subtrees, state) {
   });
   // Reuse cells where possible; rebuild if the set of ids changes.
   const desiredIds = entries.map(([id]) => id).join("|");
-  if (GridCellsEl.dataset.ids !== desiredIds) {
+  // Rebuild cells if the set of subtrees changed OR the cells were wiped
+  // (e.g. user just came back from single-view mode).
+  if (GridCellsEl.dataset.ids !== desiredIds || !GridCellsEl.firstElementChild) {
     GridCellsEl.innerHTML = "";
     GridCellsEl.dataset.ids = desiredIds;
     GridCellsEl.style.display = "grid";
@@ -494,7 +585,15 @@ function renderSubtreeGrid(subtrees, state) {
   for (const [csId, info] of entries) {
     const cell = GridCellsEl.querySelector(`[data-cs-id="${csId}"]`);
     if (!cell) continue;
-    cell.querySelector(".cell-label").textContent = info.name || csId;
+    const labelEl = cell.querySelector(".cell-label");
+    labelEl.textContent = info.name || csId;
+    labelEl.title = `Click to drill into the ${info.name || csId} case study map`;
+    labelEl.onclick = () => {
+      // Drill into this specific subtree in single-view mode.
+      ToggleMulti.checked = false;
+      viewingCaseStudyId = csId;
+      pollOnce();
+    };
     const status = cell.querySelector(".cell-status");
     status.textContent = info.complete ? "✓ done" : "live";
     status.className = "cell-status " + (info.complete ? "complete" : "live");
@@ -637,15 +736,15 @@ function renderOverviewDrawer() {
   const nEdges = (r.graph?.edges || []).length;
   const nKept = r.case_studies.filter(cs => cs.similarity_score >= 0.3).length;
   const nDropped = Object.values(r.debates || {}).filter(d => !d.survives).length;
-  const portfolio = (r.portfolio_impacts || []).map(p => `
-    <div class="row">
-      <span class="k">${p.asset_class}</span>
-      <span class="v ${p.direction === 'up' ? 'pos' : (p.direction === 'down' ? 'neg' : '')}">${p.direction} (${p.magnitude_label})</span>
+  const portfolio = (r.portfolio_impacts || []).map((p, i) => `
+    <div class="row clickable" onclick="showPortfolioDetail(${i})" title="Click for full breakdown">
+      <span class="k">${escapeHtml(p.asset_class)}</span>
+      <span class="v ${p.direction === 'up' ? 'pos' : (p.direction === 'down' ? 'neg' : '')}">${escapeHtml(p.direction)} (${escapeHtml(p.magnitude_label)})</span>
     </div>
   `).join("");
 
-  const scenarios = (r.tail_scenarios || []).map(s => `
-    <div class="quote">
+  const scenarios = (r.tail_scenarios || []).map((s, i) => `
+    <div class="quote clickable" onclick="showScenarioDetail(${i})" title="Click for full rationale + citations">
       <div class="who">${escapeHtml(s.policy_axis || "scenario")} · p=${(s.probability || 0).toFixed(2)} · ${escapeHtml(s.probability_source || "?")}${s.kalshi_market_ticker ? ' · ' + escapeHtml(s.kalshi_market_ticker) : ''}</div>
       ${escapeHtml(s.text)}
     </div>
@@ -661,7 +760,7 @@ function renderOverviewDrawer() {
     <div class="row"><span class="k">tail scenarios</span><span class="v">${(r.tail_scenarios || []).length}</span></div>
     <h3 style="margin-top: 16px;">portfolio impact</h3>
     ${portfolio || '<div class="sub">no portfolio impacts</div>'}
-    <h3 style="margin-top: 16px;">case studies (click to view full subtree)</h3>
+    <h3 style="margin-top: 16px;">case study maps (click to view)</h3>
     ${viewingCaseStudyId ? `<button onclick="viewMergedGraph()" style="margin-bottom: 8px;">← back to merged graph</button>` : ''}
     ${r.case_studies.map(cs => `
       <div class="case-study-row">
@@ -669,7 +768,7 @@ function renderOverviewDrawer() {
           <div class="cs-name">${escapeHtml(cs.name)}</div>
           <div class="cs-detail">sim <span class="${cs.similarity_score >= 0.2 ? 'v pos' : 'v neg'}">${cs.similarity_score.toFixed(2)}</span> · ${cs.subtree?.nodes ? Object.keys(cs.subtree.nodes).length : 0} nodes</div>
         </div>
-        <button onclick="viewCaseStudy('${escapeHtml(cs.id)}')">view</button>
+        <button onclick="viewCaseStudy('${escapeHtml(cs.id)}')" title="Open the ${escapeHtml(cs.name)} case study map">view map</button>
       </div>
     `).join("")}
     ${scenarios ? `<h3 style="margin-top: 16px;">tail scenarios (stage 10)</h3>${scenarios}` : ''}
@@ -795,6 +894,50 @@ function viewCaseStudy(csId) {
 function viewMergedGraph() {
   viewingCaseStudyId = null;
   pollOnce();
+}
+
+// Detail drawers for portfolio impacts and tail scenarios. Triggered from
+// the inline onclick handlers in the overview drawer.
+function showPortfolioDetail(idx) {
+  const p = currentResult?.portfolio_impacts?.[idx];
+  if (!p) return;
+  DrawerEl.dataset.locked = "1";
+  const drivers = (p.key_drivers || []).map(id => `<span class="citation-badge ok">${escapeHtml(id)}</span>`).join("");
+  const offsets = (p.offsets || []).map(id => `<span class="citation-badge missing">${escapeHtml(id)}</span>`).join("");
+  const contributing = (p.contributing_nodes || []).map(id => escapeHtml(id)).join(", ");
+  const tickers = (p.tickers || []).map(t => `<span class="citation-badge unverifiable">${escapeHtml(t)}</span>`).join("");
+  DrawerEl.innerHTML = `
+    <h2>${escapeHtml(p.asset_class.toUpperCase())}
+      <span class="badge ${p.direction === 'up' ? '' : (p.direction === 'down' ? 'dropped' : '')}">${escapeHtml(p.direction)}</span>
+    </h2>
+    <div class="sub">${escapeHtml(p.magnitude_label || "unclear")} · confidence ${(p.confidence || 0).toFixed(2)} · horizon ${p.time_horizon_days || "?"} days</div>
+    <div class="quote" style="border-left-color: var(--accent);"><div class="who">summary</div>${escapeHtml(p.summary || "")}</div>
+    ${tickers ? `<h3 style="margin-top: 14px;">candidate tickers</h3><div>${tickers}</div>` : ''}
+    ${drivers ? `<h3 style="margin-top: 14px;">key drivers</h3><div>${drivers}</div>` : ''}
+    ${offsets ? `<h3 style="margin-top: 14px;">offsets (push the other way)</h3><div>${offsets}</div>` : ''}
+    ${contributing ? `<h3 style="margin-top: 14px;">all contributing nodes</h3><div class="sub" style="font-family: inherit;">${contributing}</div>` : ''}
+    <div style="margin-top: 14px;"><button onclick="renderOverviewDrawer()">← back to overview</button></div>
+  `;
+}
+
+function showScenarioDetail(idx) {
+  const s = currentResult?.tail_scenarios?.[idx];
+  if (!s) return;
+  DrawerEl.dataset.locked = "1";
+  const newsCites = (s.news_citations || []).map(id => `<span class="citation-badge unverifiable">news:${escapeHtml(id)}</span>`).join("");
+  DrawerEl.innerHTML = `
+    <h2>tail scenario
+      <span class="badge ${s.probability_source === 'kalshi_exact' ? 'first' : ''}">p=${(s.probability || 0).toFixed(2)}</span>
+    </h2>
+    <div class="sub">${escapeHtml(s.probability_source || "?")}${s.kalshi_market_ticker ? ' · kalshi: ' + escapeHtml(s.kalshi_market_ticker) : ''} · ${escapeHtml(s.policy_axis || "?")} · ${s.time_horizon_days || "?"}d horizon</div>
+    <div class="quote" style="border-left-color: var(--accent);"><div class="who">scenario</div><strong>${escapeHtml(s.text || "")}</strong></div>
+    ${s.feedback_event && s.feedback_event !== s.text ? `<div class="quote"><div class="who">feedback event (re-runnable as a new seed)</div>${escapeHtml(s.feedback_event)}</div>` : ''}
+    ${s.kalshi_anchor_price !== null && s.kalshi_anchor_price !== undefined ? `<div class="row"><span class="k">kalshi anchor price</span><span class="v">${(s.kalshi_anchor_price || 0).toFixed(2)}</span></div>` : ''}
+    ${s.delta_rationale ? `<div class="quote"><div class="who">delta vs anchor</div>${escapeHtml(s.delta_rationale)}</div>` : ''}
+    ${s.rationale ? `<div class="quote"><div class="who">rationale</div>${escapeHtml(s.rationale)}</div>` : ''}
+    ${newsCites ? `<h3 style="margin-top: 12px;">news citations</h3><div>${newsCites}</div>` : ''}
+    <div style="margin-top: 14px;"><button onclick="renderOverviewDrawer()">← back to overview</button></div>
+  `;
 }
 
 RunBtn.addEventListener("click", startRun);

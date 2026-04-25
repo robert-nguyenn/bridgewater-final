@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,13 +24,15 @@ from src.agents import (
     scenario,
     tree_builder,
 )
+from src.agents._common import extract_json
 from src.agents.adversary import Critique
 from src.agents.defender import Rebuttal
-from src.agents.macro_comparator import ComparatorResult
+from src.agents.macro_comparator import ComparatorResult, LinkApplicability
 from src.agents.moderator import ModeratorVerdict
 from src.agents.portfolio import PortfolioImpact
 from src.agents.scenario import TailScenario
-from src.config import MODEL
+import json as _json
+from src.config import MODEL, MODEL_FAST
 from src.tools import make_default_tools, validate_citations
 from src.types import (
     CaseStudy,
@@ -94,9 +97,11 @@ class PipelineResult:
     debates: dict[str, Debate] = field(default_factory=dict)
     comparator_results: dict[str, ComparatorResult] = field(default_factory=dict)
     case_study_to_first_order: dict[str, str] = field(default_factory=dict)
+    case_study_to_first_order_ids: dict[str, list[str]] = field(default_factory=dict)  # multi-parent: cs_id → all fo_node_ids that claimed this analog
     tail_scenarios: list[TailScenario] = field(default_factory=list)
     chain_verifications: dict[str, Any] = field(default_factory=dict)
     citation_validations: dict[str, str] = field(default_factory=dict)
+    link_applicabilities: dict[str, Any] = field(default_factory=dict)
     progress_events: list[ProgressEvent] = field(default_factory=list)
     run_id: Optional[str] = None
 
@@ -105,6 +110,7 @@ class PipelineResult:
 
 DEFAULT_DEBATE_WORKERS = 4
 DEFAULT_SUBTREE_WORKERS = 4
+ANALOG_OVERFETCH_FACTOR = 2  # over-fetch this much per first-order node so macro filter + per-fo trim still yield max_analogs_per_node survivors
 
 
 def run_adversarial_debate(
@@ -287,31 +293,37 @@ def run_pipeline(
         stage=2,
     )
     case_studies: list[CaseStudy] = []
-    case_study_to_first_order: dict[str, str] = {}
+    # case_study_to_first_order and comparator_results are populated below
+    # during the pre-build macro filter so we can drop irrelevant case studies
+    # before paying for tree-builder + debate calls.
     all_debates: dict[str, Debate] = {}  # collected from per-layer debates + stage 5 trunk
-    state_lock = threading.Lock()  # guards case_studies + case_study_to_first_order
+    state_lock = threading.Lock()  # guards case_studies appends
     debates_lock = threading.Lock()  # guards all_debates updates
 
-    # 2a) Run AnalogSearch in parallel across first-order nodes.
+    # 2a) Run AnalogSearch in parallel across first-order nodes. We over-fetch
+    # by ANALOG_OVERFETCH_FACTOR so that after cross-FO dedup and the pre-build
+    # macro similarity filter, each node still has `max_analogs_per_node`
+    # survivors to attach. Per-FO trimming happens below after the filter.
+    overfetch_k = max(max_analogs_per_node * ANALOG_OVERFETCH_FACTOR, max_analogs_per_node)
+
     def _search_for_fo(fo_node: Node) -> tuple[Node, list]:
         emit(
             "analog_search_start",
-            f"  AnalogSearch for {fo_node.label!r}",
+            f"  AnalogSearch for {fo_node.label!r} (over-fetching {overfetch_k} candidates)",
             node_id=fo_node.id,
             label=fo_node.label,
         )
         eps = analog_search.run(
-            fo_node, tools=tools, model=model, client=client, run_id=run_id
+            fo_node, tools=tools, model=model, client=client, run_id=run_id,
+            k=overfetch_k,
         )
-        chosen = eps[:max_analogs_per_node]
         emit(
             "analog_search_complete",
-            f"    found {len(eps)} episodes for {fo_node.label!r}, taking top {len(chosen)}",
+            f"    found {len(eps)} episodes for {fo_node.label!r}",
             node_id=fo_node.id,
             n_found=len(eps),
-            n_taken=len(chosen),
         )
-        return fo_node, chosen
+        return fo_node, eps
 
     with ThreadPoolExecutor(max_workers=DEFAULT_SUBTREE_WORKERS) as executor:
         analog_futures = [executor.submit(_search_for_fo, fo) for fo in first_order]
@@ -319,21 +331,172 @@ def run_pipeline(
             f.result() for f in as_completed(analog_futures)
         ]
 
-    # 2b) Build the (fo_node, case_study) build tasks.
-    build_tasks: list[tuple[Node, CaseStudy]] = []
-    for fo_node, chosen in analog_results:
-        for ep in chosen:
-            cs = _build_case_study_from_episode(ep, tools)
-            if cs is None:
-                continue
+    # 2b) Cross-first-order analog dedup via one batch LLM call. Each episode
+    # carries its rank within the originating fo_node (0 = best), used below
+    # to per-FO trim after the macro filter so each node ends up with
+    # `max_analogs_per_node` surviving claims.
+    flat_pairs_with_rank: list[tuple[Node, int, Episode]] = [
+        (fo, rank, ep)
+        for fo, eps in analog_results
+        for rank, ep in enumerate(eps)
+    ]
+    flat_eps = [ep for _, _, ep in flat_pairs_with_rank]
+    group_ids = _llm_dedup_episodes(
+        flat_eps, model=MODEL_FAST, client=client, run_id=run_id
+    )
+    # Each group: {"episode": Episode, "fo_claims": [(Node, rank), ...]}
+    # If the same fo_node claims the same group multiple times, keep the best rank.
+    episode_groups: dict[str, dict[str, Any]] = {}
+    for (fo_node, rank, ep), gid in zip(flat_pairs_with_rank, group_ids):
+        group = episode_groups.setdefault(gid, {"episode": ep, "fo_claims": []})
+        existing = next(
+            (c for c in group["fo_claims"] if c[0].id == fo_node.id), None
+        )
+        if existing is None:
+            group["fo_claims"].append((fo_node, rank))
+        elif rank < existing[1]:
+            group["fo_claims"].remove(existing)
+            group["fo_claims"].append((fo_node, rank))
+
+    n_total_episode_appearances = sum(len(eps) for _, eps in analog_results)
+    n_unique_groups = len(episode_groups)
+    n_shared = sum(1 for g in episode_groups.values() if len(g["fo_claims"]) > 1)
+    if n_total_episode_appearances > n_unique_groups:
+        emit(
+            "analog_dedup_summary",
+            f"  Cross-FO dedup: {n_total_episode_appearances} episode appearances → "
+            f"{n_unique_groups} unique case studies ({n_shared} shared by ≥2 first-order nodes)",
+            n_appearances=n_total_episode_appearances,
+            n_unique=n_unique_groups,
+            n_shared=n_shared,
+        )
+
+    # 2c) Per-unique-case-study seed + macro similarity filter *before* tree
+    # building. The filter is structural (zero LLM calls). Case studies whose
+    # regime is too far from today (similarity < threshold) are dropped pre-
+    # build, saving the entire stage 3 cost for irrelevant analogs.
+    # 2c) Per-unique-case-study seed + macro similarity filter. Survivors then
+    # go through per-FO trim (2d) before subtree build kicks off in stage 3.
+    now_snapshot = _safe_macro_snapshot(today, tools)
+    comparator_results: dict[str, ComparatorResult] = {}
+    # passed_filter: cs_id → (CaseStudy, [(fo_node, rank), ...])
+    passed_filter: dict[str, tuple[CaseStudy, list[tuple[Node, int]]]] = {}
+    n_dropped_pre_build = 0
+    for gid, group in episode_groups.items():
+        ep = group["episode"]
+        fo_claims: list[tuple[Node, int]] = group["fo_claims"]
+        cs = _build_case_study_from_episode(ep, tools)
+        if cs is None:
+            continue
+        cmp_result = macro_comparator.run(
+            cs.macro_snapshot, now_snapshot, tools=tools, model=model
+        )
+        cs.similarity_score = cmp_result.similarity
+        comparator_results[cs.id] = cmp_result
+        shared_suffix = (
+            f" (shared by {len(fo_claims)} first-order nodes: "
+            f"{', '.join(repr(n.label) for n, _ in fo_claims)})"
+            if len(fo_claims) > 1 else ""
+        )
+        emit(
+            "comparator_result",
+            f"    {cs.name!r}: similarity {cs.similarity_score:.2f} "
+            f"(diverging: {', '.join(cmp_result.diverging_dimensions) or '-'}){shared_suffix}",
+            case_study_id=cs.id,
+            name=cs.name,
+            similarity=cs.similarity_score,
+            diverging=cmp_result.diverging_dimensions,
+            n_first_order_claimers=len(fo_claims),
+        )
+        if cs.similarity_score < similarity_threshold:
+            n_dropped_pre_build += 1
             emit(
-                "case_study_started",
-                f"    Queued subtree {cs.name!r} ({cs.date_range[0]} to {cs.date_range[1]}) under {fo_node.label!r}",
+                "case_study_dropped_pre_build",
+                f"    Skip {cs.name!r}: similarity {cs.similarity_score:.2f} < threshold {similarity_threshold}; not building subtree",
                 case_study_id=cs.id,
                 name=cs.name,
-                first_order_id=fo_node.id,
+                similarity=cs.similarity_score,
             )
-            build_tasks.append((fo_node, cs))
+            continue
+        passed_filter[cs.id] = (cs, fo_claims)
+
+    # 2d) Per-FO trim. Each first-order node keeps only its top
+    # `max_analogs_per_node` surviving case studies (ranked by the original
+    # AnalogSearch order, where 0 = best). A case study with all claims
+    # trimmed away is dropped entirely; one with at least one surviving claim
+    # attaches to those fo_nodes only. This guarantees each first-order node
+    # ends up with the correct analog count after macro filter + dedup.
+    fo_ranked: dict[str, list[tuple[int, str]]] = {}
+    for cs_id, (_cs, fo_claims) in passed_filter.items():
+        for fo_node, rank in fo_claims:
+            fo_ranked.setdefault(fo_node.id, []).append((rank, cs_id))
+
+    trimmed_claims: dict[str, list[str]] = {}  # cs_id → fo_ids that still claim
+    n_trimmed_excess = 0
+    for fo_id, ranked in fo_ranked.items():
+        ranked.sort()  # by rank ascending
+        kept = ranked[:max_analogs_per_node]
+        n_trimmed_excess += max(0, len(ranked) - max_analogs_per_node)
+        for _, cs_id in kept:
+            trimmed_claims.setdefault(cs_id, []).append(fo_id)
+
+    # Build the final case-study mappings + build_tasks, only for case
+    # studies with at least one surviving claim after per-FO trim.
+    build_tasks: list[tuple[Node, CaseStudy]] = []
+    case_study_to_first_order: dict[str, str] = {}
+    case_study_to_first_order_ids: dict[str, list[str]] = {}
+    n_trimmed_dropped = 0
+    for cs_id, (cs, fo_claims) in passed_filter.items():
+        surviving_fo_ids = trimmed_claims.get(cs_id, [])
+        if not surviving_fo_ids:
+            n_trimmed_dropped += 1
+            emit(
+                "case_study_trimmed_per_fo_cap",
+                f"    Trim {cs.name!r}: all claiming first-order nodes already have "
+                f"{max_analogs_per_node} better-ranked analogs",
+                case_study_id=cs.id,
+                name=cs.name,
+            )
+            continue
+        case_study_to_first_order_ids[cs.id] = surviving_fo_ids
+        case_study_to_first_order[cs.id] = surviving_fo_ids[0]
+        primary_fo = next(
+            (n for n, _ in fo_claims if n.id == surviving_fo_ids[0]),
+            fo_claims[0][0],
+        )
+        emit(
+            "case_study_started",
+            f"    Queued subtree {cs.name!r} under {primary_fo.label!r} "
+            f"(claimed by {len(surviving_fo_ids)} first-order nodes after trim)",
+            case_study_id=cs.id,
+            name=cs.name,
+            first_order_id=primary_fo.id,
+            similarity=cs.similarity_score,
+            n_first_order_claimers=len(surviving_fo_ids),
+        )
+        build_tasks.append((primary_fo, cs))
+
+    if n_dropped_pre_build or n_trimmed_excess or n_trimmed_dropped:
+        # Per-FO survival counts after both filters.
+        per_fo_counts = {
+            fo_id: min(len([cs_id for _, cs_id in ranked if cs_id in trimmed_claims and fo_id in trimmed_claims[cs_id]]), max_analogs_per_node)
+            for fo_id, ranked in fo_ranked.items()
+        }
+        per_fo_summary = ", ".join(
+            f"{fid[:8]}={count}" for fid, count in per_fo_counts.items()
+        )
+        emit(
+            "pre_build_filter_summary",
+            f"  Pre-build pipeline: {n_dropped_pre_build} dropped by macro filter, "
+            f"{n_trimmed_excess} excess claims trimmed (cap {max_analogs_per_node} per first-order node), "
+            f"{n_trimmed_dropped} case studies fully dropped after trim. "
+            f"{len(build_tasks)} survive to stage 3. Per-FO counts: {per_fo_summary}",
+            n_dropped_macro=n_dropped_pre_build,
+            n_trimmed_excess=n_trimmed_excess,
+            n_trimmed_dropped=n_trimmed_dropped,
+            n_kept=len(build_tasks),
+            per_fo_counts=per_fo_counts,
+        )
 
     # 3) Build subtrees in parallel. Each subtree's per-layer debate runs its
     # own ThreadPoolExecutor (small max_workers within), so the outer pool
@@ -485,24 +648,23 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # Stage 6: MacroComparator
     # ------------------------------------------------------------------
-    emit("stage_start", "Stage 6: MacroComparator (then vs now)", stage=6)
-    now_snapshot = _safe_macro_snapshot(today, tools)
-    comparator_results: dict[str, ComparatorResult] = {}
-    for cs in case_studies:
-        result = macro_comparator.run(
-            cs.macro_snapshot, now_snapshot, tools=tools, model=model
-        )
-        cs.similarity_score = result.similarity
-        comparator_results[cs.id] = result
-        emit(
-            "comparator_result",
-            f"  {cs.name}: similarity {result.similarity:.2f} (diverging: {', '.join(result.diverging_dimensions) or '-'})",
-            case_study_id=cs.id,
-            name=cs.name,
-            similarity=result.similarity,
-            diverging=result.diverging_dimensions,
-        )
-    emit("stage_complete", "Stage 6 done", stage=6)
+    emit(
+        "stage_start",
+        "Stage 6: MacroComparator (already computed pre-build to filter case studies)",
+        stage=6,
+    )
+    # `now_snapshot` and `comparator_results` are already populated during the
+    # pre-build macro filter (right after AnalogSearch). Re-bind locals here
+    # for downstream code clarity; comparator_results is fully populated.
+    emit(
+        "stage_complete",
+        f"Stage 6 done (no work — comparator ran pre-build, "
+        f"{len(comparator_results)} case studies have similarity scores, "
+        f"{len(case_studies)} survived to here)",
+        stage=6,
+        n_comparator=len(comparator_results),
+        n_built=len(case_studies),
+    )
 
     # ------------------------------------------------------------------
     # Stage 7: Merge surviving subtrees + prune.
@@ -512,9 +674,13 @@ def run_pipeline(
     # synthetic intermediate that the chain verifier would interpret as a
     # forward causal step.
     # ------------------------------------------------------------------
-    emit("stage_start", "Stage 7: Merge surviving subtrees + Pruner", stage=7)
-    case_study_subtree_nodes: dict[str, set[str]] = {}
-    n_attached = 0
+    emit("stage_start", "Stage 7: Per-bridge applies-today check + merge + Pruner", stage=7)
+    # Step 1: collect bridge candidates across all kept case studies.
+    # When a case study is shared (claimed by multiple first-order nodes via
+    # cross-FO analog dedup), each first-order node gets its own per-bridge
+    # applies-today check.
+    bridge_candidates: list[dict[str, Any]] = []
+    case_study_meta: dict[str, dict[str, Any]] = {}
     for cs in case_studies:
         if cs.similarity_score < similarity_threshold:
             emit(
@@ -525,29 +691,114 @@ def run_pipeline(
                 similarity=cs.similarity_score,
             )
             continue
-        fo_node_id = case_study_to_first_order.get(cs.id)
-        fo_node = graph.nodes.get(fo_node_id) if fo_node_id else None
-        if fo_node is None:
+        fo_node_ids = case_study_to_first_order_ids.get(cs.id) or (
+            [case_study_to_first_order[cs.id]] if cs.id in case_study_to_first_order else []
+        )
+        fo_nodes = [graph.nodes[fid] for fid in fo_node_ids if fid in graph.nodes]
+        if not fo_nodes:
             continue
         cs_root_id = cs.subtree.root or _first_node_id(cs.subtree)
         if cs_root_id is None:
             continue
-
-        # Find first-layer children of the case-study root: the nodes the
-        # bridge edges should point at (one per direct child of cs_root).
-        first_layer_dst_ids = [
-            e.dst for e in cs.subtree.edges if e.src == cs_root_id
-        ]
+        first_layer_dst_ids = [e.dst for e in cs.subtree.edges if e.src == cs_root_id]
         if not first_layer_dst_ids:
             continue
+        case_study_meta[cs.id] = {
+            "fo_node_ids": [n.id for n in fo_nodes],
+            "fo_nodes": fo_nodes,
+            "cs_root_id": cs_root_id,
+        }
+        for fo_node in fo_nodes:
+            for child_id in first_layer_dst_ids:
+                child_node = cs.subtree.nodes.get(child_id)
+                if child_node is None:
+                    continue
+                cs_edge = next(
+                    (e for e in cs.subtree.edges if e.src == cs_root_id and e.dst == child_id),
+                    None,
+                )
+                mechanism = (
+                    cs_edge.mechanism if cs_edge else f"{cs.name} → {child_node.label}"
+                )
+                bridge_candidates.append({
+                    "cs_id": cs.id,
+                    "cs_name": cs.name,
+                    "cs_macro": cs.macro_snapshot,
+                    "cs_similarity": cs.similarity_score,
+                    "fo_node_id": fo_node.id,
+                    "fo_node_label": fo_node.label,
+                    "child_id": child_id,
+                    "child_label": child_node.label,
+                    "mechanism": mechanism,
+                })
 
-        # Track which subtree nodes belong to this case study (excluding
-        # cs_root, which we're dropping). Used by the pruner for the
-        # similarity-based subtree drop.
+    # Step 2: parallel per-bridge applies-today check via MacroComparator.
+    # Each check picks relevant macro indices for the linkage and measures
+    # then-vs-now distance on those indices alone.
+    link_applicabilities: dict[str, LinkApplicability] = {}
+    if bridge_candidates:
+        emit(
+            "applies_today_start",
+            f"  Applies-today: checking {len(bridge_candidates)} bridge candidates",
+            n_candidates=len(bridge_candidates),
+        )
+
+        def _check_bridge(cand: dict[str, Any]) -> tuple[dict[str, Any], LinkApplicability]:
+            return cand, macro_comparator.link_applicability(
+                parent_label=cand["fo_node_label"],
+                child_label=cand["child_label"],
+                mechanism=cand["mechanism"],
+                then_snapshot=cand["cs_macro"],
+                now_snapshot=now_snapshot,
+                model=MODEL_FAST,
+                client=client,
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            applicabilities = list(executor.map(_check_bridge, bridge_candidates))
+
+        n_kept = sum(1 for _, a in applicabilities if a.applies)
+        emit(
+            "applies_today_complete",
+            f"  Applies-today: {n_kept}/{len(applicabilities)} bridges applicable",
+            n_applicable=n_kept,
+            n_total=len(applicabilities),
+        )
+    else:
+        applicabilities = []
+
+    # Group by case study for merging.
+    applies_by_cs: dict[str, list[tuple[dict[str, Any], LinkApplicability]]] = {}
+    for cand, app in applicabilities:
+        applies_by_cs.setdefault(cand["cs_id"], []).append((cand, app))
+        link_applicabilities[f"{cand['cs_id']}::{cand['child_id']}"] = app
+
+    # Step 3: merge surviving subtrees, attaching only bridges that apply today.
+    case_study_subtree_nodes: dict[str, set[str]] = {}
+    n_attached = 0
+    for cs in case_studies:
+        meta = case_study_meta.get(cs.id)
+        if meta is None:
+            continue
+        fo_nodes: list[Node] = meta["fo_nodes"]
+        cs_root_id = meta["cs_root_id"]
+
+        kept_acts = [(c, a) for c, a in applies_by_cs.get(cs.id, []) if a.applies]
+        if not kept_acts:
+            emit(
+                "subtree_skipped",
+                f"  Skip {cs.name!r}: no first-layer children apply today (all {len(applies_by_cs.get(cs.id, []))} bridges failed applicability)",
+                case_study_id=cs.id,
+                name=cs.name,
+                similarity=cs.similarity_score,
+            )
+            continue
+
+        # Layer rebase uses the deepest fo_node's layer so subtree nodes sit
+        # below all of their multi-parent first-order claimers.
+        max_fo_layer = max((n.layer or 1) for n in fo_nodes)
+
         attached_node_ids: set[str] = set()
-
-        # Copy subtree nodes EXCEPT cs_root, rebasing their layer values so
-        # they sit below the first-order node in the layered layout.
         for nid, n in cs.subtree.nodes.items():
             if nid == cs_root_id:
                 continue
@@ -555,42 +806,53 @@ def run_pipeline(
                 attached_node_ids.add(nid)
                 continue
             if n.layer is not None and n.layer >= 1:
-                n.layer = (fo_node.layer or 1) + n.layer
+                n.layer = max_fo_layer + n.layer
             graph.nodes[nid] = n
             attached_node_ids.add(nid)
 
-        # Copy subtree edges EXCEPT those originating at cs_root (those are
-        # replaced by direct bridge edges from the first-order node).
         for e in cs.subtree.edges:
             if e.src == cs_root_id:
                 continue
             graph.edges.append(e)
 
-        # Add a bridge edge per first-layer child, marked as a historical
-        # analog. The chain verifier treats these as boundary edges and won't
-        # verify chains that cross them.
-        for child_id in first_layer_dst_ids:
+        # Confidence per bridge = case-study similarity × per-link applicability.
+        # A strong case-study match plus a strong per-link match produces a
+        # high-confidence bridge; weakening either side pulls confidence down.
+        # Bridges originate from the specific fo_node that claimed the analog
+        # (and passed Layer B for this child). A shared case study can produce
+        # multiple bridges per child — one per applicable claiming fo_node.
+        unique_fo_bridges: set[str] = set()
+        for cand, app in kept_acts:
+            bridge_conf = round(cs.similarity_score * app.confidence, 4)
+            indices_str = ",".join(app.relevant_indices) or "macro"
             graph.edges.append(
                 Edge(
-                    src=fo_node_id,
-                    dst=child_id,
-                    mechanism=f"historical analog: {cs.name}",
-                    sensitivity=cs.similarity_score,
-                    confidence=cs.similarity_score,
+                    src=cand["fo_node_id"],
+                    dst=cand["child_id"],
+                    mechanism=f"historical analog: {cs.name} (applies-today via {indices_str})",
+                    sensitivity=bridge_conf,
+                    confidence=bridge_conf,
                 )
             )
+            unique_fo_bridges.add(cand["fo_node_id"])
 
         case_study_subtree_nodes[cs.id] = attached_node_ids
         n_attached += 1
+        n_bridges_total = len(applies_by_cs.get(cs.id, []))
+        shared_note = (
+            f" [shared across {len(unique_fo_bridges)} first-order nodes]"
+            if len(unique_fo_bridges) > 1 else ""
+        )
         emit(
             "subtree_attached",
-            f"  Attach {cs.name!r} to {fo_node.label!r} via {len(first_layer_dst_ids)} bridge edges "
-            f"(similarity {cs.similarity_score:.2f})",
+            f"  Attach {cs.name!r} via {len(kept_acts)}/{n_bridges_total} applicable bridges "
+            f"(similarity {cs.similarity_score:.2f}){shared_note}",
             case_study_id=cs.id,
             name=cs.name,
             similarity=cs.similarity_score,
-            first_order_id=fo_node_id,
-            n_bridges=len(first_layer_dst_ids),
+            first_order_ids=list(unique_fo_bridges),
+            n_bridges=len(kept_acts),
+            n_bridges_dropped=n_bridges_total - len(kept_acts),
             n_nodes_added=len(attached_node_ids),
         )
 
@@ -800,9 +1062,11 @@ def run_pipeline(
         debates=all_debates,
         comparator_results=comparator_results,
         case_study_to_first_order=case_study_to_first_order,
+        case_study_to_first_order_ids=case_study_to_first_order_ids,
         tail_scenarios=tail_scenarios,
         chain_verifications=chain_verifications,
         citation_validations=citation_validations,
+        link_applicabilities=link_applicabilities,
         progress_events=progress_events,
         run_id=run_id,
     )
@@ -828,6 +1092,105 @@ def _build_root_with_first_order(event: str, first_order: list[Node]) -> CausalG
             )
         )
     return CausalGraph(nodes=nodes, edges=edges, root="root")
+
+
+def _normalize_event_name(name: Optional[str]) -> Optional[str]:
+    """Lowercase, strip punctuation, collapse whitespace. Returns None for
+    empty / 'unknown' so cross-FO dedup falls back to a date+series key."""
+    if not name:
+        return None
+    s = name.lower().strip()
+    if s in ("unknown", ""):
+        return None
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or None
+
+
+def _episode_dedup_key(ep: Episode) -> str:
+    """Heuristic identity key for cross-first-order analog dedup. Used as the
+    fallback path when the LLM-based dedup fails. Two episodes that share a
+    normalized candidate_event collapse to the same key. Episodes with no
+    candidate_event fall back to `(year, month, series_id)` so two different
+    FRED proxies with extrema in the same window aren't merged."""
+    norm = _normalize_event_name(ep.candidate_event)
+    if norm:
+        return f"event:{norm}"
+    return f"date:{ep.start.year:04d}-{ep.start.month:02d}:{ep.series_id}"
+
+
+def _llm_dedup_episodes(
+    episodes: list[Episode],
+    *,
+    model: str,
+    client: Any,
+    run_id: Optional[str] = None,
+) -> list[str]:
+    """One batch LLM call that groups historical episodes into equivalence
+    classes. Catches semantic duplicates the string heuristic misses
+    ("Russia invades Ukraine" ≡ "2022 Russia-Ukraine war"). Returns a list of
+    group_id strings parallel to input order. On any failure, falls back to
+    the per-episode heuristic key.
+
+    One call per pipeline run regardless of how many episodes (~$0.01)."""
+    if not episodes:
+        return []
+    if len(episodes) == 1:
+        return [_episode_dedup_key(episodes[0])]
+
+    items = [
+        {
+            "idx": i,
+            "candidate_event": ep.candidate_event or "",
+            "start_date": str(ep.start),
+            "end_date": str(ep.end),
+            "series_id": ep.series_id,
+            "magnitude": round(ep.magnitude or 0.0, 2),
+        }
+        for i, ep in enumerate(episodes)
+    ]
+    user = (
+        "Group these historical episodes into equivalence classes. Two episodes "
+        "are equivalent if they refer to the same underlying historical event, "
+        "even if labelled differently. Examples of equivalences:\n"
+        " - 'Russia invades Ukraine' ≡ '2022 Russia-Ukraine war' ≡ "
+        "'February 2022 Russian invasion'.\n"
+        " - 'Lehman Brothers collapse' ≡ 'September 2008 financial crisis' ≡ "
+        "'2008 GFC peak'.\n"
+        " - 'COVID lockdown shock' ≡ 'March 2020 pandemic crash' ≡ "
+        "'COVID-19 outbreak'.\n"
+        "Be conservative: don't merge events that are merely topically related "
+        "(e.g. two distinct rate-cut episodes are NOT the same event).\n\n"
+        f"Episodes:\n{_json.dumps(items, indent=2, default=str)}\n\n"
+        "Return JSON only with a 'groups' array, one entry per input idx in "
+        "the same order. Use a short snake_case canonical id per group:\n"
+        '{"groups": ["ukraine_invasion_2022", "ukraine_invasion_2022", '
+        '"lehman_2008", ...]}'
+    )
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as exc:
+        logger.warning("LLM dedup call failed (%s); falling back to heuristic", exc)
+        return [_episode_dedup_key(ep) for ep in episodes]
+
+    text = msg.content[0].text if msg.content else ""
+    parsed = extract_json(text)
+    if not isinstance(parsed, dict):
+        logger.warning("LLM dedup parse failed; falling back to heuristic")
+        return [_episode_dedup_key(ep) for ep in episodes]
+    groups = parsed.get("groups", [])
+    if not isinstance(groups, list) or len(groups) != len(episodes):
+        logger.warning(
+            "LLM dedup returned %d groups for %d episodes; falling back to heuristic",
+            len(groups) if isinstance(groups, list) else -1,
+            len(episodes),
+        )
+        return [_episode_dedup_key(ep) for ep in episodes]
+    return [str(g) if g else _episode_dedup_key(episodes[i]) for i, g in enumerate(groups)]
 
 
 def _build_case_study_from_episode(

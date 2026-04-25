@@ -139,6 +139,23 @@ def _dedupe(episodes: list[Episode], *, window_days: int) -> list[Episode]:
     return kept
 
 
+SUBMIT_LABELS_TOOL = {
+    "name": "submit_labels",
+    "description": "Submit one candidate-event label per input episode in the same order.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "labels": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "candidate_event names, one per input episode in order. Use a real named event when known. Avoid 'unknown' — search if needed.",
+            },
+        },
+        "required": ["labels"],
+    },
+}
+
+
 def _label_episodes(
     node: Node,
     episodes: list[Episode],
@@ -146,7 +163,16 @@ def _label_episodes(
     model: str,
     client: Any,
     run_id: Optional[str],
+    enable_web_search: bool = True,
+    web_search_max_uses: int = 4,
 ) -> list[Optional[str]]:
+    """Label each FRED-derived episode with a named historical trigger.
+
+    Uses Claude with the server-side web_search tool when `enable_web_search=True`
+    so labels can be verified for episodes the model isn't sure about (e.g. recent
+    events past the training cutoff). The model returns labels via the
+    `submit_labels` tool; if it falls back to plain text JSON, we parse that too
+    (backward compatible with the older prompt and with test mocks)."""
     if not episodes:
         return []
     lines = [
@@ -158,31 +184,84 @@ def _label_episodes(
         "LABEL_EPISODES\n"
         f"Node label: {node.label}\n"
         f"Description: {node.description}\n\n"
-        "Episodes:\n" + "\n".join(lines)
+        "Episodes:\n" + "\n".join(lines) + "\n\n"
+        f"Submit one label per episode in the same order via submit_labels. "
+        f"For any episode where you're unsure about the named trigger, "
+        f"USE WEB_SEARCH to verify the date and identify the event. "
+        f"Avoid 'unknown' — search first."
     )
-    msg = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=_load_prompt(),
-        messages=[{"role": "user", "content": user}],
-    )
-    text = msg.content[0].text if msg.content else ""
-    parsed = extract_json(text)
-    _log(run_id, "label_episodes", {"node_id": node.id, "raw": text, "parsed": parsed})
-    if not isinstance(parsed, dict):
-        return [None] * len(episodes)
-    items = parsed.get("episodes")
-    if not isinstance(items, list):
+
+    tools = [SUBMIT_LABELS_TOOL]
+    if enable_web_search:
+        tools.insert(0, {"type": "web_search_20250305", "name": "web_search", "max_uses": web_search_max_uses})
+
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=_load_prompt(),
+            tools=tools,
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as exc:
+        logger.warning("label_episodes failed: %s", exc)
+        _log(run_id, "label_episodes_error", {"node_id": node.id, "error": str(exc)})
         return [None] * len(episodes)
 
-    out: list[Optional[str]] = []
-    for i, _ in enumerate(episodes):
-        if i < len(items) and isinstance(items[i], dict):
-            label = items[i].get("candidate_event")
-            out.append(str(label).strip() if label else None)
-        else:
-            out.append(None)
-    return out
+    # Prefer the structured tool_use response.
+    out_labels: list[Optional[str]] = []
+    parsed_via_tool = False
+    for block in getattr(msg, "content", []) or []:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "submit_labels":
+            input_data = getattr(block, "input", {}) or {}
+            raw_labels = input_data.get("labels") or []
+            for i in range(len(episodes)):
+                if i < len(raw_labels) and isinstance(raw_labels[i], str) and raw_labels[i].strip():
+                    out_labels.append(raw_labels[i].strip())
+                else:
+                    out_labels.append(None)
+            parsed_via_tool = True
+            break
+
+    # Backward compatibility: parse text JSON like the original LABEL_EPISODES contract.
+    if not parsed_via_tool:
+        text = ""
+        for block in getattr(msg, "content", []) or []:
+            if hasattr(block, "text") and isinstance(getattr(block, "text", None), str):
+                text = block.text
+                break
+        parsed = extract_json(text)
+        if isinstance(parsed, dict):
+            items = parsed.get("episodes")
+            if isinstance(items, list):
+                for i in range(len(episodes)):
+                    if i < len(items) and isinstance(items[i], dict):
+                        label = items[i].get("candidate_event")
+                        out_labels.append(str(label).strip() if label else None)
+                    else:
+                        out_labels.append(None)
+        if not out_labels:
+            out_labels = [None] * len(episodes)
+
+    # Pad to length, treat 'unknown' as no-label so downstream falls back
+    # to a series-derived name.
+    while len(out_labels) < len(episodes):
+        out_labels.append(None)
+    out_labels = [
+        None if (l is None or l.strip().lower() == "unknown") else l
+        for l in out_labels
+    ]
+    _log(
+        run_id,
+        "label_episodes",
+        {
+            "node_id": node.id,
+            "n": len(episodes),
+            "n_named": sum(1 for x in out_labels if x),
+            "via_tool_use": parsed_via_tool,
+        },
+    )
+    return out_labels[: len(episodes)]
 
 
 def _via_web_search(

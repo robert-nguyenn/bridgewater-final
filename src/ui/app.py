@@ -12,7 +12,10 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import threading
+import time
 import traceback
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -24,16 +27,131 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.config import LOGS_DIR
 from src.orchestrator import PipelineResult, ProgressEvent, run_pipeline
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+RUN_STATE_FILENAME = "state.json"
+SAVE_DEBOUNCE_SEC = 1.0      # at most one save per run per second during a run
+LOAD_MAX_RUNS = 100          # cap on how many on-disk runs to load at startup
 
 app = FastAPI(title="policy-impact-scenario-mapper")
 
-# In-memory run state. Populated by the background pipeline thread.
+# In-memory run state. Populated by the background pipeline thread; also
+# rehydrated from disk at module import via _load_run_states().
 _RUN_STATE: dict[str, dict[str, Any]] = {}
 _LOCK = threading.Lock()
+# Last save time per run, used to debounce disk writes during high-frequency
+# progress event bursts.
+_LAST_SAVE: dict[str, float] = {}
+_SAVE_LOCK = threading.Lock()
+
+
+def _save_run_state(run_id: str, *, force: bool = False) -> None:
+    """Persist a run's state to ``logs/{run_id}/state.json`` (atomic write).
+
+    Debounced to at most once per ``SAVE_DEBOUNCE_SEC`` per run during a run.
+    `force=True` bypasses the debounce — used on terminal status transitions
+    (done / failed) so the final state always lands on disk.
+    """
+    now = time.time()
+    with _SAVE_LOCK:
+        last = _LAST_SAVE.get(run_id, 0.0)
+        if not force and (now - last) < SAVE_DEBOUNCE_SEC:
+            return
+        _LAST_SAVE[run_id] = now
+
+    with _LOCK:
+        state = _RUN_STATE.get(run_id)
+        if state is None:
+            return
+        snapshot = {
+            "run_id": run_id,
+            "status": state.get("status"),
+            "events": list(state.get("events") or []),
+            "current_stage": state.get("current_stage"),
+            "trunk": state.get("trunk"),
+            "subtrees": dict(state.get("subtrees") or {}),
+            "merged_graph": state.get("merged_graph"),
+            "pruned_graph": state.get("pruned_graph"),
+            "result": state.get("result"),
+            "request": state.get("request"),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    out_path = LOGS_DIR / run_id / RUN_STATE_FILENAME
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(snapshot, f, default=str)
+        tmp_path.replace(out_path)
+    except Exception as exc:
+        logger.warning("failed to persist state for run %s: %s", run_id, exc)
+
+
+def _load_run_states(max_runs: int = LOAD_MAX_RUNS) -> int:
+    """Load on-disk run states into ``_RUN_STATE`` at module import.
+
+    Loads the ``max_runs`` most-recently-modified runs. Runs that were marked
+    ``running`` on disk are flipped to ``failed`` with a "server restarted
+    mid-run" error since their orchestrator thread didn't survive the restart.
+    """
+    if not LOGS_DIR.exists():
+        return 0
+    candidates: list[tuple[float, str, Path]] = []
+    for d in LOGS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        sf = d / RUN_STATE_FILENAME
+        if not sf.exists():
+            continue
+        try:
+            candidates.append((sf.stat().st_mtime, d.name, sf))
+        except Exception:
+            continue
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:max_runs]
+
+    loaded = 0
+    for _, rid, sf in candidates:
+        try:
+            with sf.open("r", encoding="utf-8") as f:
+                snap = json.load(f)
+        except Exception as exc:
+            logger.warning("failed to load run state %s: %s", sf, exc)
+            continue
+        status = snap.get("status") or {"state": "unknown"}
+        if status.get("state") in ("running", "queued"):
+            status = {"state": "failed", "error": "server restarted mid-run"}
+        with _LOCK:
+            _RUN_STATE[rid] = {
+                "status": status,
+                "events": snap.get("events") or [],
+                "current_stage": snap.get("current_stage"),
+                "trunk": snap.get("trunk"),
+                "subtrees": snap.get("subtrees") or {},
+                "merged_graph": snap.get("merged_graph"),
+                "pruned_graph": snap.get("pruned_graph"),
+                "result": snap.get("result"),
+                "request": snap.get("request"),
+            }
+        loaded += 1
+    if loaded:
+        logger.info("loaded %d previous run states from %s", loaded, LOGS_DIR)
+    return loaded
+
+
+# Rehydrate any on-disk runs at module import so they appear in /api/runs
+# immediately. Failures are logged and ignored — a corrupt state.json should
+# not prevent the app from serving fresh requests.
+try:
+    _load_run_states()
+except Exception as exc:
+    logger.warning("run-state rehydration failed: %s", exc)
 
 
 def _serialize(obj: Any) -> Any:
@@ -74,6 +192,9 @@ class AnalyzeResponse(BaseModel):
 
 def _on_progress_factory(run_id: str):
     def handler(ev: ProgressEvent) -> None:
+        # Persist after each event so a server crash mid-run loses at most one
+        # event's worth of state. Debounced inside _save_run_state.
+        _persist = True
         with _LOCK:
             state = _RUN_STATE.setdefault(run_id, _empty_state())
             state["events"].append({
@@ -116,6 +237,9 @@ def _on_progress_factory(run_id: str):
             # Live status text comes from the most recent stage_start.
             if ev.kind == "stage_start":
                 state["current_stage"] = ev.message
+        # Persist outside the lock to keep hold time short.
+        if _persist:
+            _save_run_state(run_id)
     return handler
 
 
@@ -138,6 +262,7 @@ def _run_in_thread(run_id: str, req: AnalyzeRequest) -> None:
         state = _RUN_STATE.setdefault(run_id, _empty_state())
         state["status"] = {"state": "running", "error": None}
         state["request"] = req.model_dump()
+    _save_run_state(run_id, force=True)
     try:
         result: PipelineResult = run_pipeline(
             req.event,
@@ -154,6 +279,7 @@ def _run_in_thread(run_id: str, req: AnalyzeRequest) -> None:
             state = _RUN_STATE[run_id]
             state["status"] = {"state": "done", "error": None}
             state["result"] = _serialize_pipeline_result(result)
+        _save_run_state(run_id, force=True)
     except Exception as exc:
         with _LOCK:
             state = _RUN_STATE.setdefault(run_id, _empty_state())
@@ -162,6 +288,7 @@ def _run_in_thread(run_id: str, req: AnalyzeRequest) -> None:
                 "error": f"{type(exc).__name__}: {exc}",
                 "traceback": traceback.format_exc(),
             }
+        _save_run_state(run_id, force=True)
 
 
 def _serialize_pipeline_result(result: PipelineResult) -> dict[str, Any]:
@@ -195,8 +322,10 @@ def _serialize_pipeline_result(result: PipelineResult) -> dict[str, Any]:
         },
         "comparator_results": {k: _serialize(v) for k, v in result.comparator_results.items()},
         "case_study_to_first_order": result.case_study_to_first_order,
+        "case_study_to_first_order_ids": dict(result.case_study_to_first_order_ids),
         "tail_scenarios": [_serialize(s) for s in result.tail_scenarios],
         "citation_validations": dict(result.citation_validations),
+        "link_applicabilities": {k: _serialize(v) for k, v in result.link_applicabilities.items()},
         "run_id": result.run_id,
     }
 
