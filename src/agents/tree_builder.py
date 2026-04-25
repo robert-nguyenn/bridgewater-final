@@ -15,7 +15,6 @@ from src.types import (
     CaseStudy,
     CausalGraph,
     Edge,
-    Evidence,
     Node,
     ToolBundle,
 )

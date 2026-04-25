@@ -71,21 +71,21 @@ def run_pipeline(event: str, *, dry_run: bool = False, model: str = MODEL) -> Ca
     tools: ToolBundle = make_default_tools()
     graph = CausalGraph()
 
-    # TODO(integration): stage 1 IdeaAgent -> first-order Nodes
-    # TODO(integration): stage 2 AnalogSearchAgent -> Episodes per first-order Node
-    # TODO(integration): stage 3 TreeBuilder + Sensitivity -> per-analog subtrees
-    # TODO(integration): stage 4 LogicVerifier -> drop chains that fail
+    # TODO(integration): stage 1 idea.run(event, tools=tools, model=model) -> first-order Nodes
+    # TODO(integration): stage 2 analog_search.run(node, tools=tools, model=model) per first-order Node
+    # TODO(integration): stage 3 tree_builder.build_subtree(case_study, tools=tools, ...) per analog
+    # TODO(integration): stage 4 logic_verifier.run(chain, nodes=graph.nodes, model=model) per chain
 
     # Stage 5: Adversarial debate. No-op until upstream stages produce edges.
     if not dry_run and graph.edges:
         run_adversarial_debate(graph, model=model)
         # TODO(integration): pass returned debates dict to stage 7 PrunerAgent
 
-    # TODO(integration): stage 6 MacroComparator
-    # TODO(integration): stage 7 PrunerAgent uses debates + comparator
-    # TODO(integration): stage 8 second TreeBuilder pass
-    # TODO(integration): stage 9 PortfolioAgent
-    # TODO(integration): stage 10 ScenarioAgent (stretch)
+    # TODO(integration): stage 6 macro_comparator.run(then, now, tools=tools, model=model)
+    # TODO(integration): stage 7 pruner.run(graph, debate=debates, comparator=..., tools=tools, model=model)
+    # TODO(integration): stage 8 second tree_builder.build_subtree pass on attached subtrees
+    # TODO(integration): stage 9 portfolio.run(terminals, tools=tools, model=model)
+    # TODO(integration): stage 10 scenario.run(news_corpus, tools=tools, model=model) (stretch)
 
     if dry_run:
         print(f"[dry-run] event={event!r} model={model}")

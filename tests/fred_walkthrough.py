@@ -23,7 +23,7 @@ from datetime import date
 import pandas as pd
 
 from src.agents import sensitivity
-from src.config import ANTHROPIC_API_KEY, FRED_API_KEY
+from src.config import ANTHROPIC_API_KEY, FRED_API_KEY, MODEL_FAST
 from src.tools import fred as fred_tool
 from src.tools import make_default_tools
 from src.types import (
@@ -189,7 +189,7 @@ def step_5_live_sensitivity() -> None:
             mechanism=mechanism,
             case_study=case,
             tools=tools,
-            model="claude-sonnet-4-5",
+            model=MODEL_FAST,
         )
     finally:
         sensitivity._call_model = original
